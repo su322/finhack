@@ -1,328 +1,554 @@
 import sys
 import time
 import traceback
+import pandas as pd
+import os
 
 from finhack.collector.tushare.helper import tsSHelper
-from finhack.library.mydb import mydb
+from finhack.library.db import DB
 from finhack.library.alert import alert
 from finhack.library.monitor import tsMonitor
 import finhack.library.log as Log
+
+
+class _PaginatedNameChange:
+    """包装 pro，使 namechange() 按年分页返回全历史。
+
+    tushare namechange 单次最多返回 10000 条；按 start_date 年度切片循环拉取，
+    合并去重后返回。其他 API 透传给原 pro，故可无缝传给 tsSHelper.getDataAndReplace。
+    """
+    _START_YEAR = 1990
+
+    def __init__(self, pro):
+        self._pro = pro
+
+    def namechange(self, **kwargs):
+        from datetime import datetime
+        frames = []
+        end_year = datetime.now().year
+        for y in range(self._START_YEAR, end_year + 1):
+            try:
+                df = self._pro.namechange(start_date=f'{y}0101', end_date=f'{y}1231')
+            except Exception as e:
+                Log.logger.warning(f'namechange {y} 年获取失败: {e}')
+                continue
+            if df is not None and len(df):
+                frames.append(df)
+                Log.logger.info(f'namechange {y} 年: {len(df)} 条')
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True).drop_duplicates()
+
+    def __getattr__(self, name):
+        # 其他属性/方法透传给原 pro（_pro 已在 __init__ 设置，不会触发本方法）
+        return getattr(self._pro, name)
+
 
 class tsAStockBasic:
     @tsMonitor
     def stock_basic(pro,db):
         table='astock_basic'
-        mydb.exec("drop table if exists "+table+"_tmp",db)
-        engine=mydb.getDBEngine(db)
-        data=pro.stock_basic(list_status='L', fields='ts_code,symbol,name,area,industry,fullname,enname,cnspell,market,exchange,curr_type,list_status,list_date,delist_date,is_hs')
-        # 预处理数据，确保股票代码等字段为字符串类型
-        for col in data.columns:
-            if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
-               'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
-                data[col] = data[col].astype(str)
-        mydb.safe_to_sql(data, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
-        data=pro.stock_basic(list_status='D', fields='ts_code,symbol,name,area,industry,fullname,enname,cnspell,market,exchange,curr_type,list_status,list_date,delist_date,is_hs')
-        # 预处理数据，确保股票代码等字段为字符串类型
-        for col in data.columns:
-            if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
-               'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
-                data[col] = data[col].astype(str)
-        mydb.safe_to_sql(data, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
-        
-        # 获取数据库适配器类型
-        from finhack.library.db import DB
-        adapter = DB.get_adapter(db)
-        adapter_type = adapter.__class__.__name__
-        
-        if adapter_type == 'DuckDBAdapter':
-            # DuckDB处理方式：尝试删除原表并重命名临时表
-            try:
-                # 检查表是否存在
-                result = DB.select_to_list(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'", db)
-                if result:
-                    # 表存在，先尝试删除原表
-                    try:
-                        # 使用 CASCADE 选项删除表及其依赖
-                        DB.exec(f"DROP TABLE IF EXISTS {table} CASCADE", db)
-                        Log.logger.info(f"成功删除原表 {table}")
-                    except Exception as e:
-                        Log.logger.error(f"删除原表失败: {str(e)}")
-                        # 尝试使用其他方式处理依赖关系
-                        try:
-                            # 查找依赖关系
-                            deps_query = f"SELECT * FROM duckdb_dependencies() WHERE dependency_name = '{table}'"
-                            deps = DB.select_to_list(deps_query, db)
-                            if deps:
-                                Log.logger.info(f"表 {table} 存在依赖关系，尝试处理")
-                                # 可以在这里添加处理依赖的代码
-                            
-                            # 再次尝试删除
-                            DB.exec(f"DROP TABLE IF EXISTS {table}", db)
-                        except Exception as inner_e:
-                            Log.logger.error(f"处理依赖关系失败: {str(inner_e)}")
-                            # 如果无法删除，备份原表
-                            DB.exec(f"ALTER TABLE {table} RENAME TO {table}_backup", db)
-                            Log.logger.info(f"已将原表重命名为 {table}_backup")
+        try:
+            # 先检查数据库目录是否可用
+            if not tsSHelper.check_database_directory(db):
+                Log.logger.error("数据库目录检查失败，无法继续操作")
+                return False
+            
+            # 检查数据库连接是否正常
+            adapter = DB.get_adapter(db)
+            if not adapter:
+                Log.logger.error("无法获取数据库适配器")
+                return False
                 
-                # 重命名临时表
-                DB.exec(f"ALTER TABLE {table}_tmp RENAME TO {table}", db)
-                table_to_use = table
-                Log.logger.info(f"成功将临时表重命名为 {table}")
-            except Exception as e:
-                Log.logger.error(f"DuckDB表替换失败: {str(e)}")
-                # 如果所有尝试都失败，使用临时表
-                table_to_use = f"{table}_tmp"
-                Log.logger.warning(f"无法完成表替换，将使用临时表 {table_to_use} 作为最终表")
-        else:
-            # MySQL重命名语法
-            mydb.exec('rename table '+table+' to '+table+'_old;',db);
-            mydb.exec('rename table '+table+'_tmp to '+table+';',db);
-            mydb.exec("drop table if exists "+table+'_old',db)
-            table_to_use = table
-        
-        tsSHelper.setIndex(table_to_use,db)
+            # 删除临时表(如果存在)
+            try:
+                DB.exec("drop table if exists "+table+"_tmp", db)
+            except Exception as drop_error:
+                Log.logger.warning(f"删除临时表失败: {str(drop_error)}")
+                # 继续执行，临时表可能不存在
+            
+            # 获取上市股票数据
+            Log.logger.info("正在获取上市股票数据...")
+            data=pro.stock_basic(list_status='L', fields='ts_code,symbol,name,area,industry,fullname,enname,cnspell,market,exchange,curr_type,list_status,list_date,delist_date,is_hs')
+            
+            # 检查数据是否为空
+            if data is None or data.empty:
+                Log.logger.error("获取上市股票数据失败：返回数据为空")
+                return False
+                
+            # 预处理数据，确保股票代码等字段为字符串类型
+            for col in data.columns:
+                if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
+                'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
+                    data[col] = data[col].astype(str)
+            
+            # 创建临时表并写入数据
+            Log.logger.info(f"正在将{len(data)}条上市股票数据写入临时表...")
+            success = DB.safe_to_sql(data, table+"_tmp", db, index=False, if_exists='replace', chunksize=5000)
+            if not success and success != 0:  # 0表示DataFrame为空，不视为错误
+                Log.logger.error("写入上市股票数据到临时表失败")
+                return False
+                
+            # 获取退市股票数据
+            Log.logger.info("正在获取退市股票数据...")
+            data=pro.stock_basic(list_status='D', fields='ts_code,symbol,name,area,industry,fullname,enname,cnspell,market,exchange,curr_type,list_status,list_date,delist_date,is_hs')
+            
+            # 检查数据是否为空
+            if data is None or data.empty:
+                Log.logger.warning("获取退市股票数据为空，仅使用上市股票数据")
+            else:
+                # 预处理数据，确保股票代码等字段为字符串类型
+                for col in data.columns:
+                    if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
+                    'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
+                        data[col] = data[col].astype(str)
+                
+                # 追加退市股票数据到临时表
+                Log.logger.info(f"正在将{len(data)}条退市股票数据追加到临时表...")
+                success = DB.safe_to_sql(data, table+"_tmp", db, index=False, if_exists='append', chunksize=5000)
+                if not success and success != 0:
+                    Log.logger.error("写入退市股票数据到临时表失败")
+                    
+            # 检查临时表是否存在
+            if not DB.table_exists(table+"_tmp", db):
+                Log.logger.error(f"临时表 {table}_tmp 不存在，无法替换目标表")
+                return False
+                
+            # 使用统一的replace_table方法替换表
+            Log.logger.info(f"正在将临时表替换为正式表...")
+            table_to_use = DB.replace_table(table, table+"_tmp", db)
+            
+            # 创建索引
+            Log.logger.info(f"正在为表 {table_to_use} 创建索引...")
+            tsSHelper.setIndex(table_to_use, db)
+            
+            Log.logger.info(f"股票基本信息获取完成，成功保存到表 {table_to_use}")
+            return True
+        except Exception as e:
+            Log.logger.error(f"获取股票基本信息失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
       
     @tsMonitor  
     def trade_cal(pro,db):
-        tsSHelper.getDataAndReplace(pro,'trade_cal','astock_trade_cal',db)
+        try:
+            return tsSHelper.getDataAndReplace(pro,'trade_cal','astock_trade_cal',db)
+        except Exception as e:
+            Log.logger.error(f"获取交易日历失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
 
         
     @tsMonitor
     def namechange(pro,db):
-        tsSHelper.getDataAndReplace(pro,'namechange','astock_namechange',db)
+        """获取股票名称变更（按年分页拉全历史，避免单次 10000 条上限）"""
+        try:
+            return tsSHelper.getDataAndReplace(
+                _PaginatedNameChange(pro), 'namechange', 'astock_namechange', db
+            )
+        except Exception as e:
+            Log.logger.error(f"获取股票名称变更失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
 
     
     @tsMonitor   
     def hs_const(pro,db):
         table='astock_hs_const'
-        mydb.exec("drop table if exists "+table+"_tmp",db)
-        engine=mydb.getDBEngine(db)
-        data = pro.hs_const(hs_type='SH')
-        # 预处理数据，确保股票代码等字段为字符串类型
-        for col in data.columns:
-            if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
-               'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
-                data[col] = data[col].astype(str)
-        mydb.safe_to_sql(data, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
-        data = pro.hs_const(hs_type='SZ')
-        # 预处理数据，确保股票代码等字段为字符串类型
-        for col in data.columns:
-            if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
-               'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
-                data[col] = data[col].astype(str)
-        mydb.safe_to_sql(data, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
-        
-        # 获取数据库适配器类型
-        from finhack.library.db import DB
-        adapter = DB.get_adapter(db)
-        adapter_type = adapter.__class__.__name__
-        
-        if adapter_type == 'DuckDBAdapter':
-            # DuckDB处理方式：尝试删除原表并重命名临时表
-            try:
-                # 检查表是否存在
-                result = DB.select_to_list(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'", db)
-                if result:
-                    # 表存在，先尝试删除原表
-                    try:
-                        # 使用 CASCADE 选项删除表及其依赖
-                        DB.exec(f"DROP TABLE IF EXISTS {table} CASCADE", db)
-                        Log.logger.info(f"成功删除原表 {table}")
-                    except Exception as e:
-                        Log.logger.error(f"删除原表失败: {str(e)}")
-                        # 尝试使用其他方式处理依赖关系
-                        try:
-                            # 查找依赖关系
-                            deps_query = f"SELECT * FROM duckdb_dependencies() WHERE dependency_name = '{table}'"
-                            deps = DB.select_to_list(deps_query, db)
-                            if deps:
-                                Log.logger.info(f"表 {table} 存在依赖关系，尝试处理")
-                                # 可以在这里添加处理依赖的代码
-                            
-                            # 再次尝试删除
-                            DB.exec(f"DROP TABLE IF EXISTS {table}", db)
-                        except Exception as inner_e:
-                            Log.logger.error(f"处理依赖关系失败: {str(inner_e)}")
-                            # 如果无法删除，备份原表
-                            DB.exec(f"ALTER TABLE {table} RENAME TO {table}_backup", db)
-                            Log.logger.info(f"已将原表重命名为 {table}_backup")
+        try:
+            # 检查数据库连接是否正常
+            adapter = DB.get_adapter(db)
+            if not adapter:
+                Log.logger.error("无法获取数据库适配器")
+                return False
                 
-                # 重命名临时表
-                DB.exec(f"ALTER TABLE {table}_tmp RENAME TO {table}", db)
-                table_to_use = table
-                Log.logger.info(f"成功将临时表重命名为 {table}")
-            except Exception as e:
-                Log.logger.error(f"DuckDB表替换失败: {str(e)}")
-                # 如果所有尝试都失败，使用临时表
-                table_to_use = f"{table}_tmp"
-                Log.logger.warning(f"无法完成表替换，将使用临时表 {table_to_use} 作为最终表")
-        else:
-            # MySQL重命名语法
-            mydb.exec('rename table '+table+' to '+table+'_old;',db);
-            mydb.exec('rename table '+table+'_tmp to '+table+';',db);
-            mydb.exec("drop table if exists "+table+'_old',db)
-            table_to_use = table
-        
-        tsSHelper.setIndex(table_to_use,db)
+            # 删除临时表(如果存在)
+            DB.exec("drop table if exists "+table+"_tmp", db)
+            
+            # 获取沪市沪深港通成分股
+            Log.logger.info("正在获取沪市沪深港通成分股...")
+            data = pro.hs_const(hs_type='SH')
+            
+            # 检查数据是否为空
+            if data is None or data.empty:
+                Log.logger.warning("获取沪市沪深港通成分股数据为空")
+                data = pd.DataFrame()
+            else:
+                # 预处理数据，确保股票代码等字段为字符串类型
+                for col in data.columns:
+                    if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
+                    'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
+                        data[col] = data[col].astype(str)
+                
+                # 写入临时表
+                Log.logger.info(f"正在将{len(data)}条沪市沪深港通成分股数据写入临时表...")
+                DB.safe_to_sql(data, table+"_tmp", db, index=False, if_exists='replace', chunksize=5000)
+            
+            # 获取深市沪深港通成分股
+            Log.logger.info("正在获取深市沪深港通成分股...")
+            sz_data = pro.hs_const(hs_type='SZ')
+            
+            # 检查数据是否为空
+            if sz_data is None or sz_data.empty:
+                Log.logger.warning("获取深市沪深港通成分股数据为空")
+            else:
+                # 预处理数据，确保股票代码等字段为字符串类型
+                for col in sz_data.columns:
+                    if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
+                    'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
+                        sz_data[col] = sz_data[col].astype(str)
+                
+                # 如果临时表已有数据，使用append模式；否则使用replace模式
+                if_exists = 'append' if not data.empty else 'replace'
+                Log.logger.info(f"正在将{len(sz_data)}条深市沪深港通成分股数据写入临时表...")
+                DB.safe_to_sql(sz_data, table+"_tmp", db, index=False, if_exists=if_exists, chunksize=5000)
+            
+            # 检查临时表是否存在
+            if not DB.table_exists(table+"_tmp", db):
+                Log.logger.error(f"临时表 {table}_tmp 不存在，无法替换目标表")
+                return False
+                
+            # 使用统一的replace_table方法替换表
+            Log.logger.info(f"正在将临时表替换为正式表...")
+            table_to_use = DB.replace_table(table, table+"_tmp", db)
+            
+            # 创建索引
+            Log.logger.info(f"正在为表 {table_to_use} 创建索引...")
+            tsSHelper.setIndex(table_to_use, db)
+            
+            Log.logger.info(f"沪深港通成分股获取完成，成功保存到表 {table_to_use}")
+            return True
+        except Exception as e:
+            Log.logger.error(f"获取沪深港通成分股失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
        
     @tsMonitor 
     def stock_company(pro,db):
         table='astock_stock_company'
-        mydb.exec("drop table if exists "+table+"_tmp",db)
-        engine=mydb.getDBEngine(db)
-        data = pro.stock_company(exchange='SZSE', fields='ts_code,exchange,chairman,manager,secretary,reg_capital,setup_date,province,city,introduction,website,email,office,employees,main_business,business_scope')
-        # 预处理数据，确保股票代码等字段为字符串类型
-        for col in data.columns:
-            if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
-               'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
-                data[col] = data[col].astype(str)
-        mydb.safe_to_sql(data, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
-        data = pro.stock_company(exchange='SSE', fields='ts_code,exchange,chairman,manager,secretary,reg_capital,setup_date,province,city,introduction,website,email,office,employees,main_business,business_scope')
-        # 预处理数据，确保股票代码等字段为字符串类型
-        for col in data.columns:
-            if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
-               'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
-                data[col] = data[col].astype(str)
-        mydb.safe_to_sql(data, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
-        
-        # 获取数据库适配器类型
-        from finhack.library.db import DB
-        adapter = DB.get_adapter(db)
-        adapter_type = adapter.__class__.__name__
-        
-        if adapter_type == 'DuckDBAdapter':
-            # DuckDB处理方式：对于已存在的表，始终使用临时表，不尝试重命名（避免依赖关系错误）
-            # 检查表是否存在
-            result = DB.select_to_list(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'", db)
-            if result:
-                # 如果表存在，直接使用临时表，不尝试重命名
-                Log.logger.info(f"表 {table} 已存在，将使用临时表 {table}_tmp 作为最终表")
-                table_to_use = f"{table}_tmp"
+        try:
+            # 检查数据库连接是否正常
+            adapter = DB.get_adapter(db)
+            if not adapter:
+                Log.logger.error("无法获取数据库适配器")
+                return False
+                
+            # 删除临时表(如果存在)
+            DB.exec("drop table if exists "+table+"_tmp", db)
+            
+            # 获取深交所上市公司基本信息
+            Log.logger.info("正在获取深交所上市公司基本信息...")
+            data = pro.stock_company(exchange='SZSE', fields='ts_code,exchange,chairman,manager,secretary,reg_capital,setup_date,province,city,introduction,website,email,office,employees,main_business,business_scope')
+            
+            # 检查数据是否为空
+            if data is None or data.empty:
+                Log.logger.warning("获取深交所上市公司基本信息为空")
+                data = pd.DataFrame()
             else:
-                # 如果表不存在，尝试重命名临时表
-                try:
-                    DB.exec(f"ALTER TABLE {table}_tmp RENAME TO {table}", db)
-                    table_to_use = table
-                    Log.logger.info(f"成功将临时表重命名为 {table}")
-                except Exception as e:
-                    Log.logger.error(f"DuckDB重命名表失败: {str(e)}")
-                    # 如果重命名失败，使用临时表
-                    table_to_use = f"{table}_tmp"
-                    Log.logger.warning(f"将使用临时表 {table}_to_use 作为最终表")
-        else:
-            # MySQL重命名语法
-            mydb.exec('rename table '+table+' to '+table+'_old;',db);
-            mydb.exec('rename table '+table+'_tmp to '+table+';',db);
-            mydb.exec("drop table if exists "+table+'_old',db)
-            table_to_use = table
-        
-        tsSHelper.setIndex(table_to_use,db)
+                # 预处理数据，确保股票代码等字段为字符串类型
+                for col in data.columns:
+                    if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
+                    'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
+                        data[col] = data[col].astype(str)
+                
+                # 写入临时表
+                Log.logger.info(f"正在将{len(data)}条深交所上市公司数据写入临时表...")
+                DB.safe_to_sql(data, table+"_tmp", db, index=False, if_exists='replace', chunksize=5000)
+            
+            # 获取上交所上市公司基本信息
+            Log.logger.info("正在获取上交所上市公司基本信息...")
+            sse_data = pro.stock_company(exchange='SSE', fields='ts_code,exchange,chairman,manager,secretary,reg_capital,setup_date,province,city,introduction,website,email,office,employees,main_business,business_scope')
+            
+            # 检查数据是否为空
+            if sse_data is None or sse_data.empty:
+                Log.logger.warning("获取上交所上市公司基本信息为空")
+            else:
+                # 预处理数据，确保股票代码等字段为字符串类型
+                for col in sse_data.columns:
+                    if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
+                    'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
+                        sse_data[col] = sse_data[col].astype(str)
+                
+                # 如果临时表已有数据，使用append模式；否则使用replace模式
+                if_exists = 'append' if not data.empty else 'replace'
+                Log.logger.info(f"正在将{len(sse_data)}条上交所上市公司数据写入临时表...")
+                DB.safe_to_sql(sse_data, table+"_tmp", db, index=False, if_exists=if_exists, chunksize=5000)
+            
+            # 检查临时表是否存在
+            if not DB.table_exists(table+"_tmp", db):
+                Log.logger.error(f"临时表 {table}_tmp 不存在，无法替换目标表")
+                return False
+                
+            # 使用统一的replace_table方法替换表
+            Log.logger.info(f"正在将临时表替换为正式表...")
+            table_to_use = DB.replace_table(table, table+"_tmp", db)
+            
+            # 创建索引
+            Log.logger.info(f"正在为表 {table_to_use} 创建索引...")
+            tsSHelper.setIndex(table_to_use, db)
+            
+            Log.logger.info(f"上市公司基本信息获取完成，成功保存到表 {table_to_use}")
+            return True
+        except Exception as e:
+            Log.logger.error(f"获取上市公司基本信息失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
     
     @tsMonitor
     def stk_managers(pro,db):
-        tsSHelper.getDataAndReplace(pro,'stk_managers','astock_stk_managers',db)
+        """
+        获取上市公司管理层（按股票代码分批获取完整数据）
 
+        修复：按ts_code分批获取，因为API不带参数只返回少量示例数据
+        支持多个股票代码批量获取
+        """
+        table = 'astock_stk_managers'
+        try:
+            adapter = DB.get_adapter(db)
+            if not adapter:
+                Log.logger.error("stk_managers: 无法获取数据库适配器")
+                return False
 
+            # 获取原表记录数（用于数据校验）
+            old_count = 0
+            try:
+                if adapter.table_exists(table):
+                    result = DB.select_to_list(f"SELECT COUNT(*) as cnt FROM {table}", db)
+                    old_count = result[0]['cnt'] if result else 0
+                    Log.logger.info(f"stk_managers: 原表有 {old_count} 条记录")
+            except Exception as count_error:
+                Log.logger.warning(f"stk_managers: 无法获取原表记录数: {str(count_error)}")
 
-    @tsMonitor
-    def stk_rewards(pro,db):
-        table='astock_stk_rewards'
-        mydb.exec("drop table if exists "+table+"_tmp",db)
-        engine=mydb.getDBEngine(db)
-        data=tsSHelper.getAllAStock(True,pro,db)
-        stock_list=data['ts_code'].tolist()
-        
-        for i in range(0,len(stock_list),100):
-            code_list=stock_list[i:i+100]
-            try_times=0
-            while True:
-                try:
-                    df = pro.stk_rewards(ts_code=','.join(code_list))
-                    # 预处理数据，确保股票代码等字段为字符串类型
-                    for col in df.columns:
-                        if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
-                           'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
-                            df[col] = df[col].astype(str)
-                    mydb.safe_to_sql(df, table+"_tmp", engine, index=False, if_exists='append', chunksize=5000)
-                    break
-                except Exception as e:
-                    if "访问权限" in str(e) or "没有接口" in str(e):
-                        Log.logger.warning("无接口权限(永久错误),跳过整个函数,不重试\n"+str(e))
-                        return
-                    if "每天最多访问" in str(e) or "每小时最多访问" in str(e):
-                        Log.logger.warning("stk_rewards:触发最多访问。\n"+str(e)) 
-                        return
-                    if "最多访问" in str(e):
-                        Log.logger.warning("stk_rewards:触发限流，等待重试。\n"+str(e))
-                        time.sleep(15)
-                        continue
-                    else:
-                        if try_times<10:
-                            try_times=try_times+1
-                            Log.logger.warning("stk_rewards:函数异常，等待重试。\n"+str(e))
+            # 删除临时表
+            DB.exec(f"DROP TABLE IF EXISTS {table}_tmp", db)
+
+            # 获取股票列表
+            Log.logger.info("stk_managers: 正在获取股票列表...")
+            data = tsSHelper.getAllAStock(True, pro, db)
+
+            if data is None or data.empty:
+                Log.logger.error("stk_managers: 获取股票列表失败")
+                return False
+
+            stock_list = data['ts_code'].tolist()
+            Log.logger.info(f"stk_managers: 共获取到 {len(stock_list)} 只股票，开始批量获取管理层信息...")
+
+            total_records = 0
+            processed_count = 0
+
+            # 每批处理100个股票（API支持多个代码）
+            for i in range(0, len(stock_list), 100):
+                code_list = stock_list[i:i+100]
+                processed_count += len(code_list)
+
+                try_times = 0
+                while try_times < 5:
+                    try:
+                        # 支持多个股票代码，用逗号分隔
+                        df = pro.stk_managers(ts_code=','.join(code_list))
+
+                        if df is not None and not df.empty:
+                            # 预处理数据
+                            for col in df.columns:
+                                if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'begin_date', 'birthday'] or \
+                                   'code' in col.lower() or 'date' in col.lower():
+                                    df[col] = df[col].fillna('').astype(str)
+
+                            # 写入临时表
+                            if i == 0:
+                                if_exists = 'replace'
+                            else:
+                                if_exists = 'append'
+
+                            DB.safe_to_sql(df, f"{table}_tmp", db, index=False, if_exists=if_exists, chunksize=5000)
+                            total_records += len(df)
+
+                        if processed_count % 1000 == 0:
+                            Log.logger.info(f"stk_managers: 已处理 {processed_count}/{len(stock_list)} 只股票，累计 {total_records} 条记录")
+
+                        break
+                    except Exception as e:
+                        try_times += 1
+                        if "每天最多访问" in str(e) or "每小时最多访问" in str(e):
+                            Log.logger.warning(f"stk_managers: 触发最多访问限制: {str(e)}")
+                            if total_records > 0 and (old_count == 0 or total_records >= old_count * 0.5):
+                                Log.logger.warning(f"stk_managers: 虽然触发限流，但已获取 {total_records} 条记录，尝试保留")
+                                break
+                            return False
+                        if "最多访问" in str(e):
+                            Log.logger.warning(f"stk_managers: 触发限流，等待重试: {str(e)}")
                             time.sleep(15)
                             continue
                         else:
-                            info = traceback.format_exc()
-                            alert.send("stk_rewards", '函数异常', str(info))
-                            Log.logger.error(str(info))
-                            return
-        
-        # 获取数据库适配器类型
-        from finhack.library.db import DB
-        adapter = DB.get_adapter(db)
-        adapter_type = adapter.__class__.__name__
-        
-        if adapter_type == 'DuckDBAdapter':
-            # DuckDB处理方式：尝试删除原表并重命名临时表
+                            Log.logger.error(f"stk_managers: 获取数据失败: {str(e)}")
+                            break
+
+                # 稍微暂停避免限流
+                time.sleep(0.3)
+
+            # 数据校验
+            Log.logger.info(f"stk_managers: 共获取 {total_records} 条记录，原表有 {old_count} 条记录")
+
+            if total_records == 0:
+                Log.logger.error("stk_managers: 未获取到任何数据")
+                return False
+
+            if old_count > 0 and total_records < old_count * 0.5:
+                Log.logger.error(f"stk_managers: 新数据量({total_records})远少于原数据量({old_count})")
+                return False
+
+            # 检查临时表
+            if not DB.table_exists(f"{table}_tmp", db):
+                Log.logger.error(f"stk_managers: 临时表 {table}_tmp 不存在")
+                return False
+
+            # 替换表
+            Log.logger.info(f"stk_managers: 正在将临时表替换为正式表...")
+            table_to_use = DB.replace_table(table, f"{table}_tmp", db)
+
+            # 创建索引
+            tsSHelper.setIndex(table_to_use, db)
+
+            Log.logger.info(f"stk_managers: 数据同步完成，共 {total_records} 条记录")
+            return True
+        except Exception as e:
+            Log.logger.error(f"获取公司管理层失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    @tsMonitor
+    def stk_rewards(pro,db):
+        """
+        获取管理层薪酬和持股（带数据校验保护）
+
+        修复：添加数据量校验，防止空数据或不完整数据覆盖原表
+        """
+        table='astock_stk_rewards'
+        try:
+            # 检查数据库连接是否正常
+            adapter = DB.get_adapter(db)
+            if not adapter:
+                Log.logger.error("无法获取数据库适配器")
+                return False
+
+            # 获取原表记录数（用于数据校验）
+            old_count = 0
             try:
-                # 检查表是否存在
-                result = DB.select_to_list(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'", db)
-                if result:
-                    # 表存在，先尝试删除原表
+                if adapter.table_exists(table):
+                    result = DB.select_to_list(f"SELECT COUNT(*) as cnt FROM {table}", db)
+                    old_count = result[0]['cnt'] if result else 0
+                    Log.logger.info(f"stk_rewards: 原表有 {old_count} 条记录")
+            except Exception as count_error:
+                Log.logger.warning(f"stk_rewards: 无法获取原表记录数: {str(count_error)}")
+
+            # 删除临时表(如果存在)
+            DB.exec("drop table if exists "+table+"_tmp", db)
+
+            # 获取股票列表
+            Log.logger.info("正在获取股票列表...")
+            data = tsSHelper.getAllAStock(True, pro, db)
+
+            if data is None or data.empty:
+                Log.logger.error("获取股票列表失败，无法继续获取管理层薪酬和持股")
+                return False
+
+            stock_list = data['ts_code'].tolist()
+            Log.logger.info(f"共获取到{len(stock_list)}只股票，开始批量获取管理层薪酬和持股...")
+
+            total_records = 0
+            processed_count = 0
+            for i in range(0, len(stock_list), 100):
+                code_list = stock_list[i:i+100]
+                processed_count += len(code_list)
+
+                try_times = 0
+                while True:
                     try:
-                        # 使用 CASCADE 选项删除表及其依赖
-                        DB.exec(f"DROP TABLE IF EXISTS {table} CASCADE", db)
-                        Log.logger.info(f"成功删除原表 {table}")
+                        df = pro.stk_rewards(ts_code=','.join(code_list))
+
+                        # 检查数据是否为空
+                        if df is not None and not df.empty:
+                            # 预处理数据，确保股票代码等字段为字符串类型
+                            for col in df.columns:
+                                if col in ['ts_code', 'symbol', 'code', 'ann_date', 'end_date', 'trade_date', 'pre_date', 'actual_date'] or \
+                                   'code' in col.lower() or 'symbol' in col.lower() or 'date' in col.lower():
+                                    df[col] = df[col].astype(str)
+
+                            # 如果是第一批数据使用replace，否则使用append
+                            if i == 0:
+                                if_exists = 'replace'
+                            else:
+                                if_exists = 'append'
+
+                            DB.safe_to_sql(df, table+"_tmp", db, index=False, if_exists=if_exists, chunksize=5000)
+                            total_records += len(df)
+
+                        if processed_count % 1000 == 0:
+                            Log.logger.info(f"stk_rewards: 已处理 {processed_count}/{len(stock_list)} 只股票，累计 {total_records} 条记录")
+
+                        break
                     except Exception as e:
-                        Log.logger.error(f"删除原表失败: {str(e)}")
-                        # 尝试使用其他方式处理依赖关系
-                        try:
-                            # 查找依赖关系
-                            deps_query = f"SELECT * FROM duckdb_dependencies() WHERE dependency_name = '{table}'"
-                            deps = DB.select_to_list(deps_query, db)
-                            if deps:
-                                Log.logger.info(f"表 {table} 存在依赖关系，尝试处理")
-                                # 可以在这里添加处理依赖的代码
-                            
-                            # 再次尝试删除
-                            DB.exec(f"DROP TABLE IF EXISTS {table}", db)
-                        except Exception as inner_e:
-                            Log.logger.error(f"处理依赖关系失败: {str(inner_e)}")
-                            # 如果无法删除，备份原表
-                            DB.exec(f"ALTER TABLE {table} RENAME TO {table}_backup", db)
-                            Log.logger.info(f"已将原表重命名为 {table}_backup")
-                
-                # 重命名临时表
-                DB.exec(f"ALTER TABLE {table}_tmp RENAME TO {table}", db)
-                table_to_use = table
-                Log.logger.info(f"成功将临时表重命名为 {table}")
-            except Exception as e:
-                Log.logger.error(f"DuckDB表替换失败: {str(e)}")
-                # 如果所有尝试都失败，使用临时表
-                table_to_use = f"{table}_tmp"
-                Log.logger.warning(f"无法完成表替换，将使用临时表 {table_to_use} 作为最终表")
-        else:
-            # MySQL重命名语法
-            mydb.exec('rename table '+table+' to '+table+'_old;',db);
-            mydb.exec('rename table '+table+'_tmp to '+table+';',db);
-            mydb.exec("drop table if exists "+table+'_old',db)
-            table_to_use = table
-        
-        tsSHelper.setIndex(table_to_use,db)
+                        if "每天最多访问" in str(e) or "每小时最多访问" in str(e):
+                            Log.logger.warning(f"stk_rewards:触发最多访问限制: {str(e)}")
+                            # 检查已获取的数据量是否足够
+                            if total_records > 0 and (old_count == 0 or total_records >= old_count * 0.5):
+                                Log.logger.warning(f"stk_rewards: 虽然触发限流，但已获取{total_records}条记录，尝试保留")
+                                break
+                            return False
+                        if "最多访问" in str(e):
+                            Log.logger.warning(f"stk_rewards:触发限流，等待重试: {str(e)}")
+                            time.sleep(15)
+                            continue
+                        else:
+                            if try_times < 10:
+                                try_times = try_times + 1
+                                Log.logger.warning(f"stk_rewards:函数异常，等待重试({try_times}/10): {str(e)}")
+                                time.sleep(15)
+                                continue
+                            else:
+                                Log.logger.error(f"stk_rewards:函数异常，重试10次失败: {str(e)}")
+                                Log.logger.error(traceback.format_exc())
+                                break
+
+            # 数据校验
+            Log.logger.info(f"stk_rewards: 共获取 {total_records} 条记录，原表有 {old_count} 条记录")
+
+            if total_records == 0:
+                Log.logger.error("stk_rewards: 未获取到任何数据，保留原表不变")
+                return False
+
+            # 如果原表有数据，且新数据量远少于原数据（少于50%），拒绝替换
+            if old_count > 0 and total_records < old_count * 0.5:
+                Log.logger.error(f"stk_rewards: 新数据量({total_records})远少于原数据量({old_count})，保留原表不变")
+                return False
+
+            # 检查临时表是否存在并有数据
+            if not DB.table_exists(table+"_tmp", db):
+                Log.logger.error(f"临时表 {table}_tmp 不存在，无法替换目标表")
+                return False
+
+            # 使用统一的replace_table方法替换表
+            Log.logger.info(f"正在将临时表替换为正式表...")
+            table_to_use = DB.replace_table(table, table+"_tmp", db)
+
+            # 创建索引
+            Log.logger.info(f"正在为表 {table_to_use} 创建索引...")
+            tsSHelper.setIndex(table_to_use, db)
+
+            Log.logger.info(f"管理层薪酬和持股数据获取完成，成功保存到表 {table_to_use}，共{total_records}条记录")
+            return True
+        except Exception as e:
+            Log.logger.error(f"获取管理层薪酬和持股失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
         
     @tsMonitor       
     def new_share(pro,db):
-        tsSHelper.getDataAndReplace(pro,'new_share','astock_new_share',db)
+        try:
+            return tsSHelper.getDataAndReplace(pro,'new_share','astock_new_share',db)
+        except Exception as e:
+            Log.logger.error(f"获取新股上市信息失败: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
 
     

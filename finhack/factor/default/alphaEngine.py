@@ -1,6 +1,8 @@
-# region Auxiliary functions
+from multiprocessing import cpu_count 
 import os
 import re
+import multiprocessing as mp
+from functools import partial
 
 import ast
 import time
@@ -39,16 +41,23 @@ class RewriteNode(ast.NodeTransformer):
 def ternary_trans(formula):
     if not '?' in formula:
         return formula
+    formula = formula.strip()
+    import re
+    _cols = re.findall(r'\$[a-zA-Z0-9_]+', formula)
+    _ph = {}
+    for i, c in enumerate(_cols):
+        p = f'_col{i}_'
+        _ph[p] = c
+        formula = formula.replace(c, p)
     formula=formula.replace('?',' if ')
     formula=formula.replace(':',' else ')
     tree=ast.parse(formula)
-    #print(ast.dump(tree))
     for node in ast.walk(tree):
-        ast.fix_missing_locations(RewriteNode().visit(node)) 
-    formula=ast.unparse(tree)
-#    print("\n转义公式:"+formula+"\n")
+        ast.fix_missing_locations(RewriteNode().visit(node))
+    formula=ast.unparse(tree).replace('\n', ' ')
+    for p, c in _ph.items():
+        formula = formula.replace(p, c)
     return formula
-
 
 def and_trans(formula):
     tree=ast.parse(formula)
@@ -56,33 +65,64 @@ def and_trans(formula):
     Log.logger.debug(ast.dump(tree))
 
     for node in ast.walk(tree):
-        ast.fix_missing_locations(RewriteNode().visit(node)) 
+        ast.fix_missing_locations(RewriteNode().visit(node))
     formula=ast.unparse(tree)
     #print("\n转义公式:"+formula+"\n")
     return formula
 
+# pandas 的 < > <= >= == != 要求两侧 Series 索引"标签+行序完全一致"(identically-labeled)，
+# 而本引擎 corr/covariance 与各 ts_* 循环算子输出是 code 分块行序、df 列与算术结果是 time 行序，
+# 标签相同行序不同时比较直接抛 "Can only compare identically-labeled Series objects"
+# (算术符/&/|会自动按标签对齐故不受影响)。比较前统一 reindex 对齐。
+def _cmp_align(x, y):
+    if isinstance(x, pd.Series) and isinstance(y, pd.Series) and not x.index.equals(y.index):
+        idx = x.index.union(y.index)
+        x, y = x.reindex(idx), y.reindex(idx)
+    return x, y
+
+def _cmp_lt(x, y):
+    x, y = _cmp_align(x, y); return x < y
+
+def _cmp_gt(x, y):
+    x, y = _cmp_align(x, y); return x > y
+
+def _cmp_le(x, y):
+    x, y = _cmp_align(x, y); return x <= y
+
+def _cmp_ge(x, y):
+    x, y = _cmp_align(x, y); return x >= y
+
+def _cmp_eq(x, y):
+    x, y = _cmp_align(x, y); return x == y
+
+def _cmp_ne(x, y):
+    x, y = _cmp_align(x, y); return x != y
+
+_CMP_FUNC = {ast.Lt: '_cmp_lt', ast.Gt: '_cmp_gt', ast.LtE: '_cmp_le',
+             ast.GtE: '_cmp_ge', ast.Eq: '_cmp_eq', ast.NotEq: '_cmp_ne'}
+
+class CompareRewrite(ast.NodeTransformer):
+    """把 a < b 等单目比较重写为 _cmp_lt(a, b)：比较前先做索引对齐再比较"""
+    def visit_Compare(self, node):
+        self.generic_visit(node)
+        if len(node.ops) == 1 and type(node.ops[0]) in _CMP_FUNC:
+            return ast.Call(func=ast.Name(id=_CMP_FUNC[type(node.ops[0])], ctx=ast.Load()),
+                            args=[node.left, node.comparators[0]], keywords=[])
+        return node
 
 def coviance(x, y, window=10):
     return covariance(x, y, window)
-    
 def covariance(x, y, window=10):
     window=int(window)
     if type(x)==type(()):
         x=x[0]
     if type(y)==type(()):
         y=y[0]
- 
-    grouped=x.groupby('ts_code')
-    cov_all=[]
-    for name,group in grouped:
-        cov=group.rolling(window).cov(y.loc[name])
-        cov_all.append(cov)
-    df=pd.concat(cov_all)
-    return df
-    
-    
-    
 
+    df=pd.DataFrame({'x':x,'y':y}).sort_index()
+    # sort_index: groupby 迭代产出 code 分块行序，归一回 time 行序(与其余算子一致，
+    # 亦避免下游比较运算 identically-labeled 报错)
+    return df.groupby('code', group_keys=False).apply(lambda g: g['x'].rolling(window).cov(g['y'])).sort_index()
 def corr(x, y, window=10):
     return correlation(x, y, window)
 def correlation(x, y, window=10):
@@ -92,14 +132,10 @@ def correlation(x, y, window=10):
     if type(y)==type(()):
         y=y[0]
         
-    df=pd.DataFrame()
-    grouped=x.groupby('ts_code')
-    corr_all=[]
-    for name,group in grouped:
-        corr=group.rolling(window).corr(y.loc[name])
-        corr_all.append(corr)
-    df=pd.concat(corr_all)
-    return df
+    df=pd.DataFrame({'x':x,'y':y}).sort_index()
+    # sort_index: groupby 迭代产出 code 分块行序，归一回 time 行序(与其余算子一致，
+    # 亦避免下游比较运算 identically-labeled 报错)
+    return df.groupby('code', group_keys=False).apply(lambda g: g['x'].rolling(window).corr(g['y'])).sort_index()
     
 def log(df):
     df=np.log(df)
@@ -163,10 +199,7 @@ def cos(x):
     
 def tan(x):  
     return np.tan(x)
-    
-        
-
-        
+ 
         
 def where(c,t,f):
     df=pd.DataFrame()
@@ -182,12 +215,9 @@ def sum(x,y=None):
         return builtins.sum(x)
     return ts_sum(x,y)
 
-
-
-
 def ts_sum(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -206,24 +236,23 @@ def ts_sum(df, window=10):
 def delta(df, period=1):
     if type(df)==type(()):
         df=df[0]
-    df=df.groupby('ts_code').diff(period)
+    period=int(period)   # alpha101 存在 delta(x, 1.06) 类小数窗口(表达式算出)，pandas diff 要求 int
+    df=df.groupby('code').diff(period)
     if len(df.index.names)==3:
         df=df.droplevel(1)
     return df
 
 
-
-
-#此函数应该是会存在未来数据
+#横截面标准化：Alpha101 定义 scale(x, a) = x * a / sum(|x|)，sum 在横截面(同一时刻所有股票)上进行
 def scale(df, k=1):
-    #return df.mul(k).div(np.abs(df).sum())
-    return df/1000
-
-
+    if type(df)==type(()):
+        df=df[0]
+    # 用 transform 保持原索引结构，避免 groupby.apply 引入额外层级；sum=0 时置 0
+    abs_sum = df.groupby('time').transform(lambda x: np.abs(x).sum())
+    return df.mul(k).div(abs_sum.replace(0, np.nan)).fillna(0)
 
 def prod(df, window=10):
     return product(df,window)
-
 
 def np_ts_prod(arr, window=10):
     result = [0] * (window-1)
@@ -233,10 +262,9 @@ def np_ts_prod(arr, window=10):
     return result
  
 
-
 def product(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -249,13 +277,11 @@ def product(df, window=10):
         ts_all.append(ts_series)
         
     df=pd.concat(ts_all)    
-    return df   
-
-
+    return df
     
 def mean(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -270,23 +296,16 @@ def mean(df, window=10):
     df=pd.concat(ts_all)    
     return df         
     
- 
-
-
-
 
 def tsmin(df, window=10):
     return ts_min(df,window)
     
-    
-    
 def tsmax(df, window=10):
     return ts_max(df,window)
     
-
 def ts_min(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -301,11 +320,9 @@ def ts_min(df, window=10):
     df=pd.concat(ts_all)    
     return df       
 
-
-
 def ts_max(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -319,7 +336,6 @@ def ts_max(df, window=10):
         
     df=pd.concat(ts_all)    
     return df     
-
 
 def delay_1(df):
     return delay(df,1)
@@ -339,7 +355,7 @@ def shift(df, period=1):
 
     
 def delay(df, period=1):
-    df=df.groupby('ts_code').shift(period)
+    df=df.groupby('code').shift(period)
     if len(df.index.names)==3:
         df=df.droplevel(1)
     return df
@@ -348,11 +364,9 @@ def std(df, window=10):
     return stddev(df,window)
 
 
-
-
 def stddev(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -381,7 +395,7 @@ def tsrank(df, window=10):
 
 def ts_rank(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_rank_all=[]
     for name,group in grouped:
         # rank=group.rolling(window)
@@ -402,7 +416,7 @@ def ts_rank(df, window=10):
 def rank(df):
     if type(df)==type(()):
         df=df[0] 
-    df=df.groupby('trade_date').rank(pct=True)
+    df=df.groupby('time').rank(pct=True)
     if len(df.index.names)==3:
         df=df.droplevel(1)
     return df  
@@ -412,7 +426,7 @@ def rank(df):
         
 def ts_argmax(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -431,7 +445,7 @@ def ts_argmax(df, window=10):
     
 def ts_argmin(df, window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -481,7 +495,7 @@ def np_decaylinear(arr, window=10):
 #这里decaylinear和wma的实现一样了，待修改
 def decaylinear(df,window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -510,7 +524,7 @@ def np_wma(arr, window=10):
 
 def wma(df,window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -541,7 +555,7 @@ def np_lowday(arr, window=10):
     
 def lowday(df,window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -571,7 +585,7 @@ def np_highday(arr, window=10):
     
 def highday(df,window=10):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -598,7 +612,7 @@ def np_sumif(arr,condition,window=10):
 
 def sumif(df,window,condition):
     window=int(window)
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if len(group)<window:
@@ -634,7 +648,7 @@ def np_regbeta(arr,B,window=10):
 
 def regbeta(A,B,window=0):
     window=int(window)
-    grouped=A.groupby('ts_code')
+    grouped=A.groupby('code')
     ts_all=[]
     for name,group in grouped:
         if window==0:
@@ -663,7 +677,7 @@ def smean(x,n,m):
 def sma(x,n,m=2):
     x = x.fillna(0)
     sma_all=[]
-    grouped=x.groupby('ts_code')
+    grouped=x.groupby('code')
     for name,group in grouped:
         res = group.copy()
         for i in range(1,len(group)):
@@ -687,7 +701,7 @@ def np_sma(arr, n,m):
 
 
 def sma(df,n,m=2):
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     ts_all=[]
     for name,group in grouped:
         ts_array=np_sma(group.values,n,m)
@@ -702,7 +716,7 @@ def sma(df,n,m=2):
 
 
 def count(condition, n):
-    grouped=condition.groupby('ts_code')
+    grouped=condition.groupby('code')
     c_all=[]
     for name,group in grouped:
         cache = group.fillna(0)#now condition is the boolean DataFrame/Series/Array
@@ -713,7 +727,7 @@ def count(condition, n):
     
     
 def sumac(df, window=10):
-    grouped=df.groupby('ts_code')
+    grouped=df.groupby('code')
     s_all=[]
     for name,A in grouped:
         s=A.rolling(window=window,min_periods = minp(window)).sum().fillna(method = 'ffill')
@@ -735,217 +749,557 @@ def minp(d):
         return d - 1
     else:
         return d * 2 // 3
- 
-
- 
 
 
-def save_lastdate(res,name):
-    #计算单日指标
-    res=res.reset_index()
-    lastdate=str(res['trade_date'].max())
-    date_factors_path=DATE_FACTORS_DIR+lastdate
-    if not os.path.exists(date_factors_path): 
-        try:
-            os.mkdir(date_factors_path)
-        except Exception as e:
-            Log.logger.error(str(e))                
-                
-    res=res[res.trade_date==lastdate]
-    res=res.set_index(['ts_code','trade_date']) 
-    res.to_csv(date_factors_path+"/"+name+'.csv',header=None)
-    return res
+class alphaEngine():   
 
-class alphaEngine():
-    def get_df(formula="",df=pd.DataFrame(),name="alpha",check=False,ignore_notice=False,stock_list=[],diff=True):
-        try:
-            #根据 $符号匹配列名
-            col_list=alphaEngine.get_col_list(formula)
-            
-            #缓存路径
-            data_path=SINGLE_FACTORS_DIR+name+'.csv'   
-            diff_date=999
-            max_date=''
-            
-            
-            # print(data_path)
-            
-            #如果只是用来检测，则diff_date保持999
-            if os.path.exists(data_path) and check==False and diff:
-                df_old=pd.read_csv(data_path, header=None, names=['ts_code','trade_date','alpha'])
-                max_date=df_old['trade_date'].max()
-                today=time.strftime("%Y%m%d",time.localtime())
-                diff_date=int(today)-int(max_date)
-
-
-            if df.empty:
-                df=factorManager.getFactors(factor_list=col_list,cache=True)
-            else:
-                df=df.sort_index()
-
-
-            #需要对比差异然后再计算
-            if diff:
-                if diff_date>0 and diff_date<100:
-                    dt=datetime.datetime.strptime(str(max_date),'%Y%m%d')
-                    start_date=dt-datetime.timedelta(days=700)
-                    start_date=start_date.strftime('%Y%m%d')
-                    df=df.reset_index()
-                    df=df[df.trade_date>=start_date]
-                    df=df.set_index(['ts_code','trade_date'])
-                elif diff_date==0:
-                    return pd.DataFrame()
-    
-    
-            if stock_list!=[]:
-                df=df.reset_index()
-                df = df[df['ts_code'].isin(stock_list)]
-                df=df.set_index(['ts_code','trade_date'])
-                
-            df=df.fillna(0)
-            return diff_date,max_date,df
-
-        except Exception as e:
-            if ignore_notice:
-                return pd.DataFrame()
-            else:
-                Log.logger.error("%s error:%s" % (name,str(e))) 
-                Log.logger.error("err exception is %s" % traceback.format_exc())
-            return 999,max_date,pd.DataFrame()        
+    @staticmethod
+    def get_alpha_list(market,freq,task_list):
+        """
+        获取所有的alpha列表
+        返回包含alpha_name和formula的字典列表
+        """
+        alpha_list = []
         
+        for root, dirs, files in os.walk(CONFIG_DIR + f"/factorlist/alphalist/{market}/{freq}/"):
+            for file in files:
+                if file in task_list.split(','):
+                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                        lines = [line.strip() for line in f.readlines()]
+                        file_name = os.path.splitext(file)[0]
+                        for i, formula in enumerate(lines, 1):
+                            alpha_name = f"{file_name}_{str(i).zfill(3)}"
+                            alpha_list.append({"name": alpha_name, "formula": formula})
+                            
+        for root, dirs, files in os.walk(CONFIG_DIR + f"/factorlist/alphalist/{market}/x{freq}/"):
+            for file in files:
+                if file in task_list.split(','):
+                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                        lines = [line.strip() for line in f.readlines()]
+                        file_name = os.path.splitext(file)[0]
+                        for i, formula in enumerate(lines, 1):
+                            alpha_name = f"{file_name}_{str(i).zfill(3)}"
+                            alpha_list.append({"name": alpha_name, "formula": formula})
+                            
+        return alpha_list
+
+
     def get_col_list(formula):
             #根据 $符号匹配列名
         col_list = []
         col_list = re.findall(r'(?:\$)[a-zA-Z0-9_]+', formula)
         col_list=list(set(col_list))
         return col_list
-            
-    def calc(formula='',df=pd.DataFrame(),name="alpha",check=False,save=False,ignore_notice=False,stock_list=[],diff=True):
-        # print(formula)
+
+    def computeAlphaBatch(market="cn_stock",freq="1d",alpha_list=[],start_date='',end_date='',code_list=[], process_num="auto"):
+            # 确定进程数量
+        if process_num == "auto":
+            # 获取CPU核心数并减1，至少为1
+            cpu_cores = cpu_count()
+            process_num = cpu_cores - 1
+            if process_num <= 0:
+                process_num = 1
+        else:
+            # 如果指定了进程数，确保它是整数
+            process_num = int(process_num)
+        
+        print(f"使用进程数: {process_num}")
+
+        # 创建进程池
+        pool = mp.Pool(processes=process_num)
+
+        # 定义部分函数
+        partial_computeAlpha = partial(alphaEngine.computeAlpha, market=market, freq=freq, start_date=start_date, end_date=end_date, code_list=code_list)
+
+        # 使用进程池并行计算
+        results = pool.map(partial_computeAlpha, alpha_list)
+
+        # 关闭进程池
+        pool.close()
+        pool.join()
+
+        return results
+
+
+    def computeAlpha(alpha_item, market="cn_stock", freq="1d", start_date='', end_date='', code_list=[]):
         try:
-            if df.empty:
-                diff_date,max_date,df=alphaEngine.get_df(formula=formula,df=df,name=name,check=check,ignore_notice=False,stock_list=stock_list,diff=diff)
-            if df.empty:
-                return df
-                
-            col_list=alphaEngine.get_col_list(formula)
+            # 计算单个alpha因子
+            """
+            计算单个alpha因子
             
-            # #缓存路径
-            data_path=SINGLE_FACTORS_DIR+name+'.csv'   
-            # diff_date=999
-            # max_date=''
+            参数:
+                alpha_item: 单个alpha项，包含name和formula
+                market: 市场类型
+                freq: 频率
+                start_date: 开始日期
+                end_date: 结束日期
+                code_list: 代码列表
             
-            
-            # # print(data_path)
-            
-            # #如果只是用来检测，则diff_date保持999
-            # if os.path.exists(data_path) and check==False:
-            #     df_old=pd.read_csv(data_path, header=None, names=['ts_code','trade_date','alpha'])
-            #     max_date=df_old['trade_date'].max()
-            #     today=time.strftime("%Y%m%d",time.localtime())
-            #     diff_date=int(today)-int(max_date)
-    
-            # if df.empty:
-            #     df=factorManager.getFactors(factor_list=col_list,cache=True)
-            # else:
-            #     df=df.sort_index()
+            返回:
+                计算结果包含alpha_name和alpha_result
+            """
+            alpha_name = alpha_item["name"]
+            formula = alpha_item["formula"]
 
-            # if diff_date>0 and diff_date<100:
-            #     dt=datetime.datetime.strptime(str(max_date),'%Y%m%d')
-            #     start_date=dt-datetime.timedelta(days=700)
-            #     start_date=start_date.strftime('%Y%m%d')
-            #     df=df.reset_index()
-            #     df=df[df.trade_date>=start_date]
-            #     df=df.set_index(['ts_code','trade_date'])
-            # elif diff_date==0:
-            #     return True
-    
-            # df=df.fillna(0)
-            
-            todolist=['indneutralize','cap','filter','self','banchmarkindex']
-            for todo in todolist:
-                if todo in formula:
-                    return pd.DataFrame()     
-                
-            formula=formula.replace("$dtm"," ($open<=delay($open,1)?0:max(($high-$open),($open-delay($open,1)))) ")
-            formula=formula.replace("$dbm"," ($open>=delay($open,1)?0:max(($open-$low),($open-delay($open,1)))) ")
-            formula=formula.replace("$tr"," max(max($high-$low,abs($high-delay($close,1))),abs($low-delay($close,1)) ) ")
-            formula=formula.replace("$hd"," $high-delay($high,1) ")
-            formula=formula.replace("$ld"," delay($low,1)-$low ")    
-
-
+            Log.logger.info(f"开始计算Alpha因子: {alpha_name}")
+            Log.logger.info(f"计算参数 - market: {market}, freq: {freq}, start_date: {start_date}, end_date: {end_date}")
+            Log.logger.info(f"原始公式: {formula}")
 
             pd.options.display.max_rows = 100
             t1=time.time()
+            
+            # 公式预处理
+            original_formula = formula
             formula=formula.replace("||"," | ")
             formula=formula.replace("&&"," & ")
             formula=formula.replace("^"," ** ")
+            formula=formula.replace("\n"," ")
             
-            # fields=['$open','$high','$low','$close','$amount','$volume','$vwap','$returns']
-            # for field in fields:
-            #     formula=formula.replace(field,"df['%s']" % (field[1:]))
-            try:
-                for col in col_list:
-                    formula=formula.replace(col,"df['%s']" % (col[1:]))
-                    df[col[1:]]=df[col[1:]].astype(float)
-            except KeyError:
-                if check:
-                    Log.logger.error("%s error:%s" % (formula,str(e))) 
-                    return pd.DataFrame()
-                else:
-                    Log.logger.error("%s error:%s" % (formula,str(e))) 
-                    return pd.DataFrame()
+            Log.logger.debug(f"公式预处理后: {formula}")
 
             if '?' in formula:
                 formula=ternary_trans(formula)
- 
-            formula=formula.replace("\n"," ")
+                Log.logger.debug(f"三元运算符转换后: {formula}")
 
-            if not check and not ignore_notice:
-                Log.logger.info(name+"计算公式:"+formula)
-            res=eval(formula)
-            
-            #这里的res是近700天的数据，可以和old_df拼接起来变成完整数据
-            
-            # print(res)
-            
-            #如果是用来检测，或者不保存，则直接返回
-            if check or save==False:
-                return res
-            else:
-                if diff_date>0 and diff_date<100:
-                    res=res.reset_index()
-                    res=res[res.trade_date>str(max_date)]
-                    res=res.set_index(['ts_code','trade_date'])        
-                    if not res.empty:
-                        res.to_csv(data_path,mode='a',header=False)
-                elif diff_date>100:
-                    res.to_csv(data_path,header=None)
-                else:
-                    return True
+            col_list=alphaEngine.get_col_list(formula)
+            Log.logger.info(f"公式依赖的列: {col_list}")
+
+            time_ranges = factorManager.timeSplit(start_date, end_date, freq)
+            Log.logger.info(f"时间范围拆分为 {len(time_ranges)} 个区间: {time_ranges}")
+
+            all_results = []  # 收集各时间区间的计算结果，用于跨区间合并
+
+            # 遍历时间区间
+            for i, (range_start, range_end) in enumerate(time_ranges):
+                Log.logger.info(f"处理Alpha时间区间 [{i+1}/{len(time_ranges)}]: {range_start} - {range_end}")
+                    
+                # 判断当前是否为最后一个time_ranges元素
+                is_last_range = (i == len(time_ranges) - 1)
+                    
+                # 如果不是最后一个区间，检查因子是否已存在
+                if not is_last_range:
+                    should_skip = True
+                    factor_info = factorManager.inspectFactor(alpha_name, market=market, freq=freq,start_date=range_start, end_date=range_end,only_exists=True)
+                    if not factor_info["exists"]:
+                        should_skip = False
+                        Log.logger.debug(f"Alpha因子 {alpha_name} 在时间区间 {range_start}-{range_end} 不存在，需要计算")
+                    else:
+                        Log.logger.debug(f"Alpha因子 {alpha_name} 在时间区间 {range_start}-{range_end} 已存在")
                         
-
-                #计算单日指标
-                res=save_lastdate(res,name)
-
-                del df
-                del res
+                    if should_skip:
+                        Log.logger.info(f"时间区间 {range_start} - {range_end} 的Alpha因子已存在，跳过计算")
+                        continue
+                    
+                # 加载该时间区间的依赖字段数据
+                # 根据频率调整起始日期，确保有足够的历史数据用于计算
+                adjusted_start_date = factorManager.adjustStartDateByFreq(range_start, freq)
+                Log.logger.info(f"调整Alpha计算窗口 - 原始: {range_start}, 调整后: {adjusted_start_date}")
                 
-            return True
+                Log.logger.info(f"开始加载Alpha依赖数据 - 字段: {[s.replace('$', '', 1) for s in col_list]}")
+                # 统一 freq 感知加载：loadFactorsAuto 内部按 freq 自动 chunk(1m)/全量(1d)。
+                # 1d/1m 都走 _process_alpha_df（去重→列替换→eval→结果处理→存盘），消除双路径。
+                _prep = alphaEngine._prep_formula(formula)
+                _prep_cols = alphaEngine.get_col_list(_prep)
+                for _chunk_df in factorManager.loadFactorsAuto(
+                            matrix_list=[s.replace('$', '', 1) for s in _prep_cols],
+                            code_list=code_list, market=market, freq=freq,
+                            start_date=adjusted_start_date, end_date=range_end):
+                    _r = alphaEngine._process_alpha_df(_chunk_df, _prep, alpha_name,
+                                                       range_start, range_end, market, freq)
+                    if _r is not None and not _r.empty:
+                        all_results.append(_r)
+                continue  # 下方 1d 旧路径（df=loadFactors + 内联列替换/eval/save）已被上方取代，保留待清理
+                df = factorManager.loadFactors(
+                            matrix_list=[s.replace('$', '', 1) for s in col_list],
+                            vector_list=[],
+                            code_list=code_list,
+                            market=market,
+                            freq=freq,
+                            start_date=adjusted_start_date,  # 使用调整后的起始日期
+                            end_date=range_end,
+                            cache=True  # 使用缓存加速
+                )
+
+                Log.logger.info(f"成功加载Alpha数据 - 数据量: {len(df)}, 列数: {len(df.columns)}")
+                Log.logger.debug(f"数据列名: {list(df.columns)}")
+                Log.logger.debug(f"数据索引信息: {df.index.names if hasattr(df.index, 'names') else 'Simple Index'}")
+                
+                if len(df) > 0:
+                    Log.logger.debug(f"Alpha数据样本:\n{df.head()}")
+
+                # 防御：去除重复 (time,code) 行（多市场数据质量参差；get_factors 读取时已去重，mock/其他来源未必）
+                if isinstance(df.index, pd.MultiIndex) and df.index.duplicated().any():
+                    _dup = int(df.index.duplicated().sum())
+                    df = df[~df.index.duplicated(keep='last')]
+                    Log.logger.debug(f"去除重复索引行 {_dup} 条")
+
+                if df.empty:
+                    Log.logger.warning(f"Alpha数据为空，跳过该区间: {alpha_name} [{range_start}-{range_end}]")
+                    continue
+                
+                try:
+                    Log.logger.debug("开始处理Alpha公式中的列名替换")
+                    processed_formula = formula
+                    for col in col_list:
+                        clean_col = col[1:]  # 移除$符号
+                        if clean_col not in df.columns:
+                            Log.logger.error(f"Alpha计算缺少必需的列: {clean_col}")
+                            Log.logger.error(f"可用的列: {list(df.columns)}")
+                            Log.logger.error(f"公式: {original_formula}")
+                            continue
+                        
+                        processed_formula = processed_formula.replace(col, f"df['{clean_col}']")
+                        df[clean_col] = df[clean_col].astype(float)
+                        Log.logger.debug(f"列 {col} -> df['{clean_col}']，数据类型转换为float")
+                        
+                except KeyError as e:
+                    Log.logger.error(f"Alpha公式处理错误 - {alpha_name}: {str(e)}")
+                    Log.logger.error(f"原始公式: {original_formula}")
+                    Log.logger.error(f"处理后公式: {processed_formula}")
+                    Log.logger.error(f"可用列: {list(df.columns)}")
+                    continue
+
+                Log.logger.info(f"{alpha_name} 最终计算公式: {processed_formula}")
+                
+                try:
+                    Log.logger.debug("开始执行Alpha公式计算")
+                    res = eval(processed_formula)
+                    Log.logger.info(f"Alpha公式计算完成，结果类型: {type(res)}")
+                    
+                    if hasattr(res, 'shape'):
+                        Log.logger.debug(f"计算结果形状: {res.shape}")
+                    elif hasattr(res, '__len__'):
+                        Log.logger.debug(f"计算结果长度: {len(res)}")
+                        
+                except Exception as e:
+                    Log.logger.error(f"Alpha公式执行失败 - {alpha_name}: {str(e)}")
+                    Log.logger.error(f"公式: {processed_formula}")
+                    Log.logger.error(f"数据信息: {len(df)} rows, columns: {list(df.columns)}")
+                    traceback.print_exc()
+                    continue
+
+                # 创建结果DataFrame
+                result_df = pd.DataFrame()
+                
+                try:
+                    # 检查res是否为Series或DataFrame，并相应处理
+                    if isinstance(res, pd.Series):
+                        Log.logger.debug("将Series结果转换为DataFrame")
+                        result_df = pd.DataFrame({alpha_name: res})
+                    elif isinstance(res, pd.DataFrame):
+                        Log.logger.debug("处理DataFrame结果")
+                        if len(res.columns) == 1:
+                            result_df = res.rename(columns={res.columns[0]: alpha_name})
+                        else:
+                            Log.logger.debug(f"DataFrame有多列({len(res.columns)})，选择第一列")
+                            result_df = pd.DataFrame({alpha_name: res.iloc[:, 0]})
+                    else:
+                        Log.logger.warning(f"未知的结果类型: {type(res)}，尝试转换为DataFrame")
+                        result_df = pd.DataFrame({alpha_name: res})
+                        
+                    Log.logger.info(f"结果DataFrame创建成功，数据量: {len(result_df)}")
+                    
+                except Exception as e:
+                    Log.logger.error(f"创建结果DataFrame失败: {str(e)}")
+                    Log.logger.error(f"结果类型: {type(res)}")
+                    if hasattr(res, 'shape'):
+                        Log.logger.error(f"结果形状: {res.shape}")
+                    traceback.print_exc()
+                
+                # 过滤结果，确保只保存在指定日期范围内的数据
+                if not result_df.empty:
+                    # 使用当前处理的时间范围进行过滤，而不是整个任务的日期范围
+                    current_start_date = range_start
+                    current_end_date = range_end
+                    
+                    # 确保end_date处理
+                    if current_end_date == 'now':
+                        current_end_date = datetime.datetime.now().strftime("%Y%m%d")
+                        
+                    try:
+                        # 获取结果DataFrame中的时间索引
+                        if isinstance(result_df.index, pd.MultiIndex):
+                            times = result_df.index.get_level_values('time')
+                        else:
+                            # 如果不是MultiIndex，检查是否有time列
+                            if 'time' in result_df.columns:
+                                times = result_df['time']
+                            else:
+                                # 假设整个索引就是时间
+                                times = result_df.index
+                        
+                        # 确保times是datetime类型
+                        if not pd.api.types.is_datetime64_any_dtype(times):
+                            try:
+                                # 尝试将times转换为datetime
+                                times = pd.to_datetime(times)
+                                Log.logger.debug("成功将Alpha结果时间索引转换为datetime类型")
+                            except Exception as e:
+                                Log.logger.error(f"无法将Alpha结果时间索引转换为datetime: {str(e)}")
+                                Log.logger.error("跳过日期过滤，使用原始数据")
+                                continue
+                        
+                        # 统一时区处理
+                        # 1. 先判断times是否有时区信息
+                        has_tz = False
+                        if hasattr(times, 'tz') and times.tz is not None:
+                            has_tz = True
+                            tz_info = times.tz
+                            Log.logger.debug(f"检测到Alpha结果时区信息: {tz_info}")
+                        
+                        # 2. 转换输入的日期为datetime对象
+                        start_datetime = pd.to_datetime(current_start_date)
+                        end_datetime = pd.to_datetime(current_end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                        
+                        # 3. 根据times的时区情况统一处理
+                        if has_tz:
+                            # 如果times有时区，将start_datetime和end_datetime本地化为相同时区
+                            try:
+                                start_datetime = start_datetime.tz_localize(tz_info)
+                                end_datetime = end_datetime.tz_localize(tz_info)
+                            except TypeError:  # 已经有时区信息的情况
+                                start_datetime = start_datetime.tz_convert(tz_info)
+                                end_datetime = end_datetime.tz_convert(tz_info)
+                        else:
+                            # 如果times没有时区，移除所有时区信息
+                            if hasattr(times, 'dt'):  # Series类型
+                                times = times.dt.tz_localize(None)
+                            else:  # DatetimeIndex类型
+                                times = times.tz_localize(None)
+                            
+                            # 确保start_datetime和end_datetime也没有时区信息
+                            if hasattr(start_datetime, 'tzinfo') and start_datetime.tzinfo is not None:
+                                start_datetime = start_datetime.tz_localize(None)
+                            if hasattr(end_datetime, 'tzinfo') and end_datetime.tzinfo is not None:
+                                end_datetime = end_datetime.tz_localize(None)
+                        
+                        # 创建日期过滤条件
+                        date_mask = (times >= start_datetime) & (times <= end_datetime)
+                        
+                        # 应用过滤
+                        filtered_df = result_df[date_mask]
+                        
+                        # 如果过滤后结果为空，则记录警告
+                        if filtered_df.empty and not result_df.empty:
+                            Log.logger.warning(f"Alpha日期过滤后没有符合范围 {current_start_date} - {current_end_date} 的数据")
+                            Log.logger.warning(f"时间范围: {start_datetime} - {end_datetime}")
+                            Log.logger.warning(f"样本时间: {times.iloc[0] if hasattr(times, 'iloc') else times[0]}")
+                        else:
+                            Log.logger.info(f"Alpha日期过滤: {len(result_df)} -> {len(filtered_df)} 条记录")
+                            result_df = filtered_df
+                    except Exception as e:
+                        Log.logger.error(f"Alpha日期过滤过程出错: {str(e)}")
+                        Log.logger.error(f"当前处理区间: {current_start_date} - {current_end_date}")
+                        if 'times' in locals():
+                            Log.logger.error(f"时间数据类型: {type(times)}")
+                            Log.logger.error(f"时区信息: {getattr(times, 'tz', None)}")
+                            if len(times) > 0:
+                                Log.logger.error(f"样本时间: {times.iloc[0] if hasattr(times, 'iloc') else times[0]}")
+                        Log.logger.error("跳过日期过滤，使用原始数据")
+                        traceback.print_exc()
+                
+                # 整理结果的索引结构
+                if 'time' in result_df.columns:
+                    result_df = result_df.reset_index(drop=True)
+                else:
+                    result_df = result_df.reset_index(drop=False)
+                
+                # 排序和设置索引
+                try:
+                    result_df = result_df.sort_values(by=['time', 'code'])
+                    result_df = result_df.set_index(['time', 'code'])
+                    Log.logger.debug("成功设置Alpha结果的时间和代码索引")
+                except Exception as e:
+                    Log.logger.error(f"设置Alpha结果索引时出错: {str(e)}")
+                    Log.logger.error(f"结果DataFrame列名: {list(result_df.columns)}")
+                    if 'time' not in result_df.columns:
+                        Log.logger.error("结果中缺少time列")
+                    if 'code' not in result_df.columns:
+                        Log.logger.error("结果中缺少code列")
+                    traceback.print_exc()
+                
+                # 保存因子数据
+                try:
+                    Log.logger.info(f"开始保存Alpha因子数据: {alpha_name}")
+                    factorManager.saveFactors(result_df, [alpha_name], market, freq)
+                    Log.logger.info(f"Alpha因子数据保存完成: {alpha_name}")
+                except Exception as e:
+                    Log.logger.error(f"保存Alpha因子数据失败: {str(e)}")
+                    Log.logger.error(f"因子名: {alpha_name}, 数据量: {len(result_df)}")
+                    traceback.print_exc()
+                
+                Log.logger.info(f"计算Alpha因子 {alpha_name} 区间 [{range_start}-{range_end}] 成功，数据量: {len(result_df)}")
+                if len(result_df) > 0:
+                    Log.logger.debug(f"Alpha结果数据样本:\n{result_df.head()}")
+
+                all_results.append(result_df)
+
+            # 所有时间区间处理完毕，汇总结果
+            computation_time = time.time() - t1
+            if all_results:
+                final_result = pd.concat(all_results)
+                Log.logger.info(f"Alpha因子 {alpha_name} 全部区间完成: {len(all_results)} 个区间, 合并后数据量: {len(final_result)}, 总耗时: {computation_time:.2f} 秒")
+                return {"name": alpha_name, "result": final_result}
+            else:
+                Log.logger.warning(f"Alpha因子 {alpha_name} 所有区间均无有效结果, 总耗时: {computation_time:.2f} 秒")
+                return {"name": alpha_name, "result": pd.DataFrame()}
 
         except Exception as e:
-            if ignore_notice:
+            Log.logger.error(f"计算Alpha因子 {alpha_item['name']} 失败: {str(e)}")
+            Log.logger.error(f"Alpha项信息: {alpha_item}")
+            Log.logger.error(f"计算参数: market={market}, freq={freq}, start_date={start_date}, end_date={end_date}")
+            traceback.print_exc()
+            return {"name": alpha_item["name"], "result": pd.DataFrame()}
+
+    # ============ 单公式计算工具（供 factorMining 等复用）============
+    @staticmethod
+    def _prep_formula(formula):
+        """公式预处理：语法转换 + alpha191 特殊字段展开 + 三元"""
+        formula = formula.replace("||", " | ").replace("&&", " & ").replace("^", " ** ").replace("\n", " ")
+        # alpha191 #69 的 dtm/dbm 等（无 indicator 定义时的兜底展开）
+        formula = formula.replace("$dtm", " ($open<=delay($open,1)?0:max(($high-$open),($open-delay($open,1)))) ")
+        formula = formula.replace("$dbm", " ($open>=delay($open,1)?0:max(($open-$low),($open-delay($open,1)))) ")
+        formula = formula.replace("$tr", " max(max($high-$low,abs($high-delay($close,1))),abs($low-delay($close,1))) ")
+        formula = formula.replace("$hd", " $high-delay($high,1) ")
+        formula = formula.replace("$ld", " delay($low,1)-$low ")
+        if '?' in formula:
+            formula = ternary_trans(formula)
+        # 比较运算符重写为 _cmp_*（比较前先索引对齐）：修 corr/ts 算子(code 分块行序)与
+        # df 列/算术结果(time 行序)之间比较时 "identically-labeled" 报错（如 alpha191_148）。
+        # 放三元转换之后，where(...) 条件里的比较也能被覆盖。
+        if re.search(r'[<>]=?|==|!=', formula):
+            _cols = re.findall(r'\$[a-zA-Z0-9_]+', formula)
+            _ph = {}
+            for i, c in enumerate(_cols):
+                p = f'_ph{i}_'
+                _ph[p] = c
+                formula = formula.replace(c, p)   # $xxx 非法标识符，先占位
+            try:
+                tree = CompareRewrite().visit(ast.parse(formula))
+                ast.fix_missing_locations(tree)
+                formula = ast.unparse(tree)
+            except SyntaxError:
+                pass                              # 解析失败保持原样，交给 eval 原样报错
+            for p, c in _ph.items():
+                formula = formula.replace(p, c)
+        return formula
+
+    @staticmethod
+    def get_df(formula='', df=pd.DataFrame(), code_list=[], market='cn_stock', freq='1d',
+               start_date='', end_date=''):
+        """准备公式依赖的数据。df 非空时直接用；否则按公式字段 loadFactors。
+        返回 DataFrame（索引 time, code）。"""
+        try:
+            if df is None or df.empty:
+                col_list = alphaEngine.get_col_list(formula)
+                df = factorManager.loadFactors(
+                    matrix_list=[c[1:] for c in col_list],
+                    code_list=code_list, market=market, freq=freq,
+                    start_date=start_date, end_date=end_date)
+            if df is None or df.empty:
                 return pd.DataFrame()
-            todolist=[]#['identically-labeled']
-            for todo in todolist:
-                if todo in str(e):
-                    return pd.DataFrame()
-                else:
-                    if(len(df)>100):
-                        Log.logger.error("%s error:%s" % (name,str(e))) 
-                        Log.logger.error("err exception is %s" % traceback.format_exc())
-            if(len(df)>100):
-                Log.logger.error("%s error:%s" % (name,str(e))) 
-                Log.logger.error("err exception is %s" % traceback.format_exc())
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.sort_index()
+            return df
+        except Exception as e:
+            Log.logger.error(f"get_df error: {e}")
             return pd.DataFrame()
-        pass
+
+    @staticmethod
+    def calc(formula='', df=pd.DataFrame(), name='alpha', save=False,
+             market='cn_stock', freq='1d', code_list=[], start_date='', end_date=''):
+        """在给定 df 上计算单个 alpha 公式，返回结果 Series（索引 time,code）。
+        df 为空时自动 loadFactors；save=True 时落盘为因子。"""
+        try:
+            # 跳过当前引擎不支持的公式（依赖行业/市值/基准等外部数据）
+            for todo in ['indneutralize', 'cap', 'filter', 'self', 'banchmarkindex']:
+                if todo in formula:
+                    return pd.Series()
+            formula = alphaEngine._prep_formula(formula)
+            col_list = alphaEngine.get_col_list(formula)
+            if df is None or df.empty:
+                df = alphaEngine.get_df(formula=formula, code_list=code_list, market=market, freq=freq,
+                                        start_date=start_date, end_date=end_date)
+            if df is None or df.empty:
+                return pd.Series()
+            for col in col_list:
+                clean = col[1:]
+                if clean not in df.columns:
+                    return pd.Series()
+                formula = formula.replace(col, f"df['{clean}']")
+                df[clean] = df[clean].astype(float)
+            res = eval(formula)
+            if isinstance(res, pd.DataFrame):
+                res = res.iloc[:, 0]
+            if not isinstance(res, pd.Series):
+                res = pd.Series(res, index=df.index)
+            if save and not res.empty:
+                res.name = name
+                factorManager.saveFactors(res.to_frame(name=name), [name], market, freq)
+            return res
+        except Exception as e:
+            Log.logger.debug(f"calc error: {formula} -> {e}")
+            return pd.Series()
+
+    @staticmethod
+    def _process_alpha_df(df, formula, alpha_name, range_start, range_end,
+                          market='cn_stock', freq='1d'):
+        """在给定 df（全量或 chunk）上算 alpha 并存盘。供 computeAlpha 的 1d/1m 两种模式复用。
+        formula 应已 _prep_formula 预处理（含 dtm/dbm 展开）。返回 result_df 或 None。"""
+        import datetime as _dt
+        if df is None or df.empty:
+            return None
+        if isinstance(df.index, pd.MultiIndex) and df.index.duplicated().any():
+            df = df[~df.index.duplicated(keep='last')]
+        if df.empty:
+            return None
+        try:
+            cols = alphaEngine.get_col_list(formula)
+            for col in cols:
+                clean = col[1:]
+                if clean not in df.columns:
+                    return None
+                formula = formula.replace(col, f"df['{clean}']")
+                df[clean] = df[clean].astype(float)
+            res = eval(formula)
+            if isinstance(res, pd.DataFrame):
+                res = res.iloc[:, 0]
+            if not isinstance(res, pd.Series):
+                res = pd.Series(res, index=df.index)
+            result_df = pd.DataFrame({alpha_name: res})
+            if result_df.empty:
+                return None
+            # 日期过滤（只保留 range_start~range_end）
+            rs = range_start if range_start != 'now' else _dt.datetime.now().strftime('%Y%m%d')
+            re_ = range_end if range_end != 'now' else _dt.datetime.now().strftime('%Y%m%d')
+            try:
+                if isinstance(result_df.index, pd.MultiIndex):
+                    times = result_df.index.get_level_values('time')
+                else:
+                    times = result_df.index
+                if not pd.api.types.is_datetime64_any_dtype(times):
+                    times = pd.to_datetime(times)
+                s_dt = pd.to_datetime(rs)
+                e_dt = pd.to_datetime(re_) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                result_df = result_df[(times >= s_dt) & (times <= e_dt)]
+            except Exception as e:
+                Log.logger.debug(f"_process_alpha_df 日期过滤跳过: {e}")
+            if result_df.empty:
+                return None
+            if 'time' in result_df.columns:
+                result_df = result_df.reset_index(drop=True)
+            else:
+                result_df = result_df.reset_index(drop=False)
+            try:
+                result_df = result_df.sort_values(by=['time', 'code']).set_index(['time', 'code'])
+            except Exception:
+                pass
+            try:
+                factorManager.saveFactors(result_df, [alpha_name], market, freq)
+            except Exception as e:
+                Log.logger.error(f"_process_alpha_df save 失败: {e}")
+            return result_df
+        except Exception as e:
+            Log.logger.debug(f"_process_alpha_df error: {formula} -> {e}")
+            return None
+        

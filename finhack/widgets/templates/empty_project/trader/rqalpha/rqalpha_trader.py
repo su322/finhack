@@ -1,6 +1,6 @@
 from runtime.constant import *
 import runtime.global_var as global_var
-from finhack.library.class_loader import ClassLoader
+from finhack.core.loader.class_loader import ClassLoader
 import cloudpickle as pickle
 import sys
 import os
@@ -10,7 +10,7 @@ from datetime import datetime
 import json
 from rqalpha import run_code
 import hashlib
-from finhack.library.mydb import mydb
+from finhack.library.db import DB
 import numpy as np
 #finhack trader run --model_id=f7fd6531b6ec1ad6bc884ec5c6faeedb --strategy=ChatgptAIStrategy --vendor=qmt
 
@@ -201,7 +201,7 @@ class RqalphaTrader:
 
             # 删除已存在的instance_id记录
             delete_query = f"DELETE FROM rqalpha WHERE instance_id = '{instance_id}';"
-            mydb.exec(delete_query,'finhack')
+            DB.exec(delete_query,'finhack')
             # 准备插入数据的SQL语句
             # 构建列名和占位符
 
@@ -223,7 +223,7 @@ class RqalphaTrader:
             insert_sql = f"INSERT INTO rqalpha (instance_id, {columns}) VALUES ('{instance_id}', {formatted_values});"
 
             print(insert_sql)
-            mydb.exec(insert_sql,'finhack')
+            DB.exec(insert_sql,'finhack')
             # 提交到数据库执行
    
         except Exception as e:

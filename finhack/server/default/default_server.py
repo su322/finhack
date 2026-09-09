@@ -1,23 +1,40 @@
 from runtime.constant import *
 import runtime.global_var as global_var
-from finhack.library.class_loader import ClassLoader
+from finhack.core.loader.class_loader import ClassLoader
 import threading
 import json
 import os
 import importlib
 import finhack.library.log as Log
 import runtime.global_var as global_var
-from finhack.library.mydb import mydb
+from finhack.library.db import DB
 from finhack.trader.default.default_trader import DefaultTrader
 from flask import Flask, send_from_directory,render_template,request
 import re
 class DefaultServer:
-    def run(self):
+    def __init__(self, args):
+        # BaseLoader 实例化时传 args（与 DefaultTrader 一致），存为 self.args 供 run() 用
+        self.args = args
+
+    def run(self, args=None):
         app = Flask(__name__,
                     template_folder=REPORTS_DIR,
                     static_folder=REPORTS_DIR+'static/')
 
         root_directory = REPORTS_DIR
+
+        # 挂载 REST API（finhack dashboard 用：/api/markets /api/factors /api/run/* 等）
+        try:
+            from finhack.server.default.api import api_bp
+            app.register_blueprint(api_bp)
+            Log.logger.info("API blueprint mounted at /api")
+        except Exception as e:
+            Log.logger.warning(f"API blueprint 挂载失败（dashboard 将不可用）: {e}")
+
+        @app.route('/dashboard')
+        def dashboard():
+            """finhack 量化全流程 Dashboard（Vue3 + ECharts SPA）"""
+            return send_from_directory(root_directory, 'dashboard.html')
 
         # @app.route('/<path:path>')
         # def static_proxy(path):
@@ -40,8 +57,16 @@ class DefaultServer:
 
         @app.route('/btlog')
         def btlog():
-            id = request.args.get('id')
-            
+            # 原 view 无 return（Flask 返回 None → TypeError 500）。返回最近一份回测日志尾部。
+            import glob as _g
+            from runtime.constant import DATA_DIR
+            logs = sorted(_g.glob(os.path.join(DATA_DIR, 'logs', 'trader', '*.log'),
+                                  key=os.path.getmtime, reverse=True))
+            if not logs:
+                return '<pre>no trader logs</pre>'
+            with open(logs[0], 'r', encoding='utf-8', errors='replace') as f:
+                tail = f.readlines()[-500:]
+            return '<pre>' + ''.join(tail) + '</pre>'
 
         @app.route('/detail')
         def detail():
@@ -90,13 +115,22 @@ class DefaultServer:
 
         @app.route('/')
         def redirect_to_index():
+            # 原 render_template('index.html')：demo_project 无 templates 目录 → TemplateNotFound 500。
+            # dashboard 是静态单页（root_directory/dashboard.html），根路径直接送它。
+            idx = os.path.join(root_directory, 'index.html')
+            if os.path.isfile(idx):
+                return send_from_directory(root_directory, 'index.html')
+            return send_from_directory(root_directory, 'dashboard.html')
+
+        @app.route('/legacy_index')
+        def legacy_index():
             strategy = request.args.get('strategy')
             # where=' where 1=1 and created_at > (NOW() - INTERVAL 1 DAY)'
             # if strategy:
             #     where=where+f" and strategy='{strategy}'"
-            #     bt_list=mydb.selectToList(f"SELECT id, instance_id, features_list, train, model, strategy, start_date, end_date, init_cash, params, total_value, alpha, beta, annual_return, cagr, annual_volatility, info_ratio, downside_risk, R2, sharpe, sortino, calmar, omega, max_down, SQN, created_at, filter, win, server, trade_num, runtime, starttime, endtime,  roto, simulate, benchmark, strategy_code FROM `finhack`.`backtest` {where} order by sharpe desc LIMIT 100",'finhack')
+            #     bt_list=DB.select_to_list(f"SELECT id, instance_id, features_list, train, model, strategy, start_date, end_date, init_cash, params, total_value, alpha, beta, annual_return, cagr, annual_volatility, info_ratio, downside_risk, R2, sharpe, sortino, calmar, omega, max_down, SQN, created_at, filter, win, server, trade_num, runtime, starttime, endtime,  roto, simulate, benchmark, strategy_code FROM `finhack`.`backtest` {where} order by sharpe desc LIMIT 100",'finhack')
             # else:
-            #     bt_list=mydb.selectToList(f"SELECT id, instance_id, features_list, train, model, strategy, start_date, end_date, init_cash, params, total_value, alpha, beta, annual_return, cagr, annual_volatility, info_ratio, downside_risk, R2, sharpe, sortino, calmar, omega, max_down, SQN, created_at, filter, win, server, trade_num, runtime, starttime, endtime,  roto, simulate, benchmark, strategy_code FROM `finhack`.`backtest` {where} order by sharpe desc LIMIT 100",'finhack')   
+            #     bt_list=DB.select_to_list(f"SELECT id, instance_id, features_list, train, model, strategy, start_date, end_date, init_cash, params, total_value, alpha, beta, annual_return, cagr, annual_volatility, info_ratio, downside_risk, R2, sharpe, sortino, calmar, omega, max_down, SQN, created_at, filter, win, server, trade_num, runtime, starttime, endtime,  roto, simulate, benchmark, strategy_code FROM `finhack`.`backtest` {where} order by sharpe desc LIMIT 100",'finhack')   
             
 
             sql=""
@@ -112,13 +146,15 @@ class DefaultServer:
             ORDER BY b.sharpe desc limit 100"""
 
 
-            bt_list=mydb.selectToList(sql,'finhack')
+            bt_list=DB.select_to_list(sql,'finhack')
 
             return render_template('index.html', data=bt_list)
 
         # 不再需要检查 __name__ == '__main__'，因为这个方法将被直接调用
+        # host 默认 0.0.0.0（外部可访问），可通过 host= 参数覆盖；port 默认 5000
         app.run(debug=False,
-                port=int(self.args.port)
+                host=getattr(self.args, 'host', '0.0.0.0') or '0.0.0.0',
+                port=int(getattr(self.args, 'port', 5000) or 5000)
             )
 
 

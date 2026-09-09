@@ -1,0 +1,431 @@
+import os
+import re
+import pymysql
+import pandas as pd
+from sqlalchemy import create_engine, text
+from typing import List, Dict, Any, Optional, Tuple
+
+import finhack.library.log as Log
+from finhack.library.db_adpter.base import DbAdapter
+from finhack.library.monitor import dbMonitor
+
+
+class MySQLAdapter(DbAdapter):
+    """MySQL数据库适配器实现"""
+    
+    def __init__(self, config):
+        """
+        初始化MySQL适配器
+        
+        Args:
+            config: 数据库配置
+        """
+        self.config = config
+        
+    @dbMonitor
+    def get_engine(self, read_only=False):
+        """获取SQLAlchemy引擎"""
+        conn_str = f"mysql+pymysql://{self.config['user']}:{self.config['password']}@" \
+                  f"{self.config['host']}:{self.config['port']}/{self.config['db']}?charset={self.config['charset']}"
+        return create_engine(conn_str, echo=False)
+    
+    @dbMonitor
+    def get_connection(self):
+        """获取数据库连接"""
+        db = pymysql.connect(
+            host=self.config['host'],
+            port=int(self.config['port']), 
+            user=self.config['user'], 
+            password=self.config['password'], 
+            db=self.config['db'], 
+            charset=self.config['charset'],
+            cursorclass=pymysql.cursors.DictCursor)
+        return db, db.cursor()
+    
+    @dbMonitor
+    def exec_sql(self, sql: str) -> None:
+        """执行SQL语句"""
+        # 预处理SQL，确保索引语句包含列长度（对于TEXT/BLOB类型）
+        sql = self._adapt_sql_for_mysql(sql)
+        
+        db, cursor = self.get_connection()
+        try:
+            cursor.execute(sql)
+            db.commit()
+        except Exception as e:
+            Log.logger.error(f"MySQL执行SQL错误: {str(e)}\nSQL: {sql}")
+            raise
+        finally:
+            db.close()
+            
+    def _adapt_sql_for_mysql(self, sql: str) -> str:
+        """
+        确保SQL语句兼容MySQL语法，尤其是对于索引创建语句
+        
+        Args:
+            sql: 原始SQL语句
+            
+        Returns:
+            str: 处理后的SQL语句
+        """
+        # 处理CREATE INDEX语句，确保TEXT/BLOB类型的列有长度限制
+        if sql.lower().startswith('create index'):
+            # 检查是否已包含长度限制
+            if not re.search(r'\([^)]+\(\d+\)\)', sql):
+                # 尝试为没有长度限制的列添加限制
+                # 匹配 "ON table_name (column_name)" 模式
+                match = re.search(r'ON\s+(\w+)\s*\(([^)]+)\)', sql)
+                if match:
+                    table_name = match.group(1)
+                    column_name = match.group(2).strip()
+                    
+                    # 如果是创建TEXT/BLOB类型列的索引但没有指定长度，添加长度限制
+                    if not re.search(r'\(\d+\)', column_name):
+                        Log.logger.debug(f"为CREATE INDEX语句添加列长度限制: {sql}")
+                        # 添加默认长度32
+                        sql = sql.replace(f"({column_name})", f"({column_name}(32))")
+                        Log.logger.debug(f"处理后的SQL: {sql}")
+        
+        return sql
+    
+    @dbMonitor
+    def select_to_list(self, sql: str) -> List[Dict[str, Any]]:
+        """执行SQL查询，返回结果列表"""
+        result_list = []
+        db, cursor = self.get_connection()
+        try:
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            for row in results:
+                result_list.append(row)
+        except Exception as e:
+            Log.logger.error(f"MySQL查询错误: {str(e)}\nSQL: {sql}")
+            raise
+        finally:
+            db.close()
+        return result_list
+    
+    @dbMonitor
+    def select_to_df(self, sql: str) -> pd.DataFrame:
+        """执行SQL查询，返回DataFrame"""
+        db, cursor = self.get_connection()
+        try:
+            cursor.execute(sql)
+            results = cursor.fetchall()
+            results = pd.DataFrame(list(results))
+        except Exception as e:
+            Log.logger.error(f"MySQL查询错误: {str(e)}\nSQL: {sql}")
+            results = pd.DataFrame()
+        finally:
+            db.close()
+        return results
+    
+    @dbMonitor
+    def select(self, sql: str) -> List[Dict[str, Any]]:
+        """执行SQL查询，返回结果集"""
+        db, cursor = self.get_connection()
+        try:
+            cursor.execute(sql)
+            results = cursor.fetchall()
+        except Exception as e:
+            Log.logger.error(f"MySQL查询错误: {str(e)}\nSQL: {sql}")
+            results = []
+        finally:
+            cursor.close()
+            db.close()
+        return results
+    
+    @dbMonitor
+    def select_one(self, sql: str) -> Optional[Dict[str, Any]]:
+        """执行SQL查询，返回单条结果"""
+        results = self.select_to_df(sql)
+        if len(results) > 0:
+            return results.iloc[0:1]
+        return pd.DataFrame()
+    
+    def to_sql(self, df: pd.DataFrame, table_name: str, if_exists='append', **kwargs) -> int:
+        """将DataFrame写入数据库"""
+        # 空DataFrame检查
+        if df.empty or len(df.columns) == 0:
+            Log.logger.warning(f"尝试写入空DataFrame到表 {table_name}, 操作已跳过")
+            return 0
+            
+        engine = self.get_engine()
+        result = df.to_sql(table_name, engine, index=False, if_exists=if_exists, chunksize=5000)
+        
+        # 增强日志记录：包含日期范围信息
+        date_info = self._extract_date_range_info(df)
+        if date_info:
+            Log.logger.info(f"成功写入 {len(df)} 条记录到表 {table_name} ({date_info})")
+        else:
+            Log.logger.info(f"成功写入 {len(df)} 条记录到表 {table_name}")
+            
+        return result
+    
+    def _extract_date_range_info(self, df: pd.DataFrame) -> str:
+        """
+        从DataFrame中提取日期范围信息用于日志记录
+        
+        Args:
+            df: DataFrame数据
+            
+        Returns:
+            包含日期范围的字符串，如果没有找到日期列则返回空字符串
+        """
+        if df.empty:
+            return ""
+            
+        # 常见的日期列名
+        date_columns = [
+            'trade_date', 'ann_date', 'end_date', 'start_date', 'list_date', 
+            'delist_date', 'date', 'cal_date', 'pre_date', 'actual_date'
+        ]
+        
+        # 查找第一个存在的日期列
+        date_col = None
+        for col in date_columns:
+            if col in df.columns:
+                date_col = col
+                break
+                
+        if date_col is None:
+            # 查找列名包含"date"的列
+            for col in df.columns:
+                if 'date' in col.lower():
+                    date_col = col
+                    break
+                    
+        if date_col is None:
+            return ""
+            
+        try:
+            # 获取该列的非空值
+            date_series = df[date_col].dropna()
+            if date_series.empty:
+                return ""
+                
+            # 转换为字符串并排序（处理不同格式的日期）
+            date_strings = date_series.astype(str).sort_values()
+            min_date = date_strings.iloc[0]
+            max_date = date_strings.iloc[-1]
+            
+            # 如果最小日期和最大日期相同，只显示一个日期
+            if min_date == max_date:
+                return f"日期: {min_date}"
+            else:
+                return f"日期范围: {min_date} ~ {max_date}"
+                
+        except Exception as e:
+            # 如果日期解析出错，返回空字符串
+            return ""
+    
+    def safe_to_sql(self, df: pd.DataFrame, table_name: str, **kwargs) -> int:
+        """安全地将DataFrame写入数据库，处理可能的列缺失问题。类型转换已移除。"""
+        # 空DataFrame检查
+        if df.empty or len(df.columns) == 0:
+            Log.logger.warning(f"尝试写入空DataFrame到表 {table_name}, 操作已跳过")
+            return 0
+            
+        engine = self.get_engine()
+        
+        final_to_sql_kwargs = kwargs.copy()
+        final_to_sql_kwargs.setdefault('index', False)
+        final_to_sql_kwargs.setdefault('if_exists', 'append')
+
+        try:
+            # 类型转换循环已从此方法中移除
+            
+            # 检查表是否存在
+            if not self.table_exists(table_name):
+                # 如果表不存在，直接创建表
+                return df.to_sql(table_name, engine, **final_to_sql_kwargs)
+            
+            # 表存在，获取表的列信息
+            try:
+                columns_query = f"SHOW COLUMNS FROM {table_name}"
+                with engine.connect() as conn:
+                    result = conn.execute(text(columns_query))
+                    existing_columns = {row[0] for row in result.fetchall()}
+                
+                missing_columns = [col for col in df.columns if col not in existing_columns]
+                
+                if missing_columns:
+                    for col in missing_columns:
+                        col_type_str = str(df[col].dtype)
+                        sql_type = "VARCHAR(255)"  # 默认类型
+                        if "int" in col_type_str:
+                            sql_type = "BIGINT"
+                        elif "float" in col_type_str:
+                            sql_type = "DOUBLE"
+                        elif "datetime" in col_type_str:
+                            sql_type = "DATETIME"
+                        elif "bool" in col_type_str:
+                            sql_type = "BOOLEAN" # MySQL supports BOOLEAN (alias for TINYINT(1))
+                        
+                        alter_query = f"ALTER TABLE {table_name} ADD COLUMN `{col}` {sql_type}"
+                        try:
+                            with engine.connect() as conn:
+                                conn.execute(text(alter_query))
+                                conn.commit()
+                            Log.logger.info(f"成功添加列 {col} 到表 {table_name}")
+                        except Exception as add_col_error:
+                            # 如果添加列失败（且不是因为列已存在），记录错误并抛出异常
+                            if "Duplicate column" not in str(add_col_error):
+                                Log.logger.error(f"添加列 {col} 到表 {table_name} 失败: {str(add_col_error)}")
+                                raise
+                            else:
+                                Log.logger.warning(f"尝试添加已存在的列 {col} 到表 {table_name}: {str(add_col_error)}")
+            except Exception as e:
+                Log.logger.warning(f"获取表 {table_name} 的列信息或添加列时失败: {str(e)}")
+                # 继续尝试写入，让数据库处理或引发更具体的错误
+            
+            # 尝试写入数据
+            return df.to_sql(table_name, engine, **final_to_sql_kwargs)
+                
+        except Exception as e:
+            error_str = str(e)
+            # 检查是否是"Unknown column"错误 (MySQL specific)
+            unknown_col_match = re.search(r"Unknown column '([^']+)'", error_str)
+            
+            if unknown_col_match:
+                missing_column = unknown_col_match.group(1)
+                Log.logger.warning(f"写入时表 {table_name} 中缺少列 {missing_column}，尝试添加该列")
+                
+                if missing_column in df.columns:
+                    sql_type = "VARCHAR(255)"
+                    try:
+                        with engine.connect() as conn:
+                            alter_query = f"ALTER TABLE {table_name} ADD COLUMN `{missing_column}` {sql_type}"
+                            conn.execute(text(alter_query))
+                            conn.commit()
+                        Log.logger.info(f"成功添加列 {missing_column} 到表 {table_name}")
+                        
+                        # 重试写入操作
+                        return df.to_sql(table_name, engine, **final_to_sql_kwargs)
+                    except Exception as add_col_error:
+                        Log.logger.error(f"重试时添加列 {missing_column} 失败: {str(add_col_error)}")
+                        raise # 添加列失败，重新抛出异常
+                else:
+                    Log.logger.error(f"DataFrame 中不包含尝试添加的未知列 {missing_column}")
+                    raise # 列不在DataFrame中，无法修复，重新抛出原始异常
+            else:
+                # 如果不是我们可以处理的"Unknown column"错误，则重新抛出原始异常
+                Log.logger.error(f"MySQL写入DataFrame异常: {str(e)}")
+                raise
+    
+    @dbMonitor
+    def truncate_table(self, table: str) -> bool:
+        """截断表 - 增加表存在性检查"""
+        try:
+            # 先检查表是否存在
+            if not self.table_exists(table):
+                Log.logger.warning(f"尝试截断不存在的表 {table}，操作跳过")
+                return True  # 表不存在时返回True，因为目标已达到（表为空）
+            
+            self.exec_sql(f"TRUNCATE TABLE {table}")
+            Log.logger.info(f"成功截断表 {table}")
+            return True
+        except Exception as e:
+            Log.logger.error(f"截断表 {table} 失败: {str(e)}")
+            return False
+    
+    @dbMonitor
+    def delete(self, sql: str) -> None:
+        """执行删除操作"""
+        self.exec_sql(sql)
+    
+    def table_exists(self, table_name: str) -> bool:
+        """检查表是否存在"""
+        try:
+            engine = self.get_engine()
+            with engine.connect() as connection:
+                query = f"SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}'"
+                result = connection.execute(text(query)).fetchone()
+                return result is not None
+        except Exception as e:
+            Log.logger.error(f"检查表 {table_name} 是否存在时发生错误: {str(e)}")
+            return False
+    
+    def set_index(self, table: str) -> None:
+        """设置表索引"""
+        index_list=['ts_code','end_date','trade_date']
+        for index in index_list:
+            try:
+                # MySQL索引语法 - 使用列长度限制
+                sql = f"CREATE INDEX {index} ON {table} ({index}(10))"
+                self.exec_sql(sql)
+            except Exception as e:
+                Log.logger.warning(f"为表 {table} 创建索引 {index} 失败: {str(e)}")
+                
+    @dbMonitor
+    def replace_table(self, target_table: str, source_table: str) -> Tuple[bool, str]:
+        """
+        替换表（将source_table替换为target_table）
+        专门处理MySQL的表替换逻辑
+        
+        Args:
+            target_table: 目标表名
+            source_table: 源表名（通常是临时表）
+            
+        Returns:
+            一个元组 (成功状态, 最终使用的表名)
+        """
+        try:
+            # 检查目标表是否存在
+            if self.table_exists(target_table):
+                # 表存在，先备份原表
+                self.exec_sql(f"RENAME TABLE {target_table} TO {target_table}_old")
+                Log.logger.info(f"成功将原表重命名为 {target_table}_old")
+                
+            # 重命名临时表为目标表
+            self.exec_sql(f"RENAME TABLE {source_table} TO {target_table}")
+            Log.logger.info(f"成功将临时表重命名为 {target_table}")
+            
+            # 如果有备份表，则删除它
+            if self.table_exists(f"{target_table}_old"):
+                self.exec_sql(f"DROP TABLE IF EXISTS {target_table}_old")
+                Log.logger.info(f"成功删除旧表 {target_table}_old")
+                
+            return True, target_table
+        except Exception as e:
+            Log.logger.error(f"MySQL表替换失败: {str(e)}")
+            # 如果重命名失败，尝试使用临时表
+            if self.table_exists(source_table):
+                Log.logger.warning(f"无法完成表替换，将使用临时表 {source_table} 作为最终表")
+                return False, source_table
+            # 如果临时表也不存在，尝试恢复原表
+            elif self.table_exists(f"{target_table}_old"):
+                try:
+                    self.exec_sql(f"RENAME TABLE {target_table}_old TO {target_table}")
+                    Log.logger.warning(f"恢复原表 {target_table}")
+                    return False, target_table
+                except Exception as restore_e:
+                    Log.logger.error(f"恢复原表失败: {str(restore_e)}")
+                    return False, f"{target_table}_old"
+            else:
+                return False, ""  # 无可用表 
+    
+    def get_table_columns(self, table_name: str) -> list:
+        """
+        获取表的列名列表
+        
+        Args:
+            table_name: 表名
+            
+        Returns:
+            列名列表
+        """
+        try:
+            db, cursor = self.get_connection()
+            try:
+                cursor.execute(f"SHOW COLUMNS FROM {table_name}")
+                columns = [row['Field'] for row in cursor.fetchall()]
+                return columns
+            except Exception as e:
+                Log.logger.error(f"获取表 {table_name} 的列失败: {str(e)}")
+                return []
+            finally:
+                db.close()
+        except Exception as e:
+            Log.logger.error(f"获取数据库连接失败: {str(e)}")
+            return [] 

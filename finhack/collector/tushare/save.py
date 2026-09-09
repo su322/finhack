@@ -4,9 +4,10 @@ import pandas as pd
 from datetime import datetime
 import concurrent.futures
 import numpy as np
-from finhack.library.mydb import mydb
+from finhack.library.db import DB
 from finhack.library.config import Config
 import finhack.library.log as Log
+from runtime.constant import DATA_DIR
 
 class TushareSaver:
     def __init__(self):
@@ -21,7 +22,57 @@ class TushareSaver:
             'cb_daily': 'cn_cb',
             'fund_daily': 'cn_fund',
             'fx_daily': 'global_fx',
-            'hk_daily': 'hk_stock'
+            'hk_daily': 'hk_stock',
+            'futures_daily': 'cn_future'
+        }
+        
+        # 定义代码列表表名与输出映射
+        self.list_tables_map = {
+            'astock_basic': {'output_path': 'market/reference/cn_stock/cn_stock_list.csv', 'region': 'cn', 'type': 'stock'},
+            'astock_namechange': {'output_path': 'market/reference/cn_stock/cn_stock_namechange.csv', 'region': 'cn', 'type': 'stock'},
+            'astock_index_basic': {'output_path': 'market/reference/cn_index/cn_index_list.csv', 'region': 'cn', 'type': 'index'},
+            'cb_basic': {'output_path': 'market/reference/cn_cb/cn_cb_list.csv', 'region': 'cn', 'type': 'cb'},
+            'fund_basic': {'output_path': 'market/reference/cn_fund/cn_fund_list.csv', 'region': 'cn', 'type': 'fund'},
+            'futures_basic': {'output_path': 'market/reference/cn_future/cn_futr_list.csv', 'region': 'cn', 'type': 'future'},
+            'fx_basic': {'output_path': 'market/reference/global_forex/global_forex_list.csv', 'region': 'global', 'type': 'forex'},
+            'hk_basic': {'output_path': 'market/reference/hk_stock/hk_stock_list.csv', 'region': 'hk', 'type': 'stock'}
+        }
+        
+        # 定义复权因子表与输出映射
+        self.adj_tables_map = {
+            'astock_price_adj_factor': {'output_path': 'market/reference/cn_stock/cn_stock_adj.csv'},
+            'fund_adj': {'output_path': 'market/reference/cn_fund/cn_fund_adj.csv'}
+        }
+        
+        # 定义交易日历表与输出映射
+        self.calendar_tables_map = {
+            'astock_trade_cal': [
+                {'output_path': 'market/reference/cn_stock/cn_stock_calendar.csv'},
+                {'output_path': 'market/reference/cn_index/cn_index_calendar.csv'},
+                {'output_path': 'market/reference/cn_fund/cn_fund_calendar.csv'},
+                {'output_path': 'market/reference/cn_cb/cn_cb_calendar.csv'}
+            ],
+            'futures_trade_cal': [
+                {'output_path': 'market/reference/cn_future/cn_future_calendar.csv'}
+            ],
+            'hk_tradecal': [
+                {'output_path': 'market/reference/hk_stock/hk_stock_calendar.csv', 'add_exchange': 'hk'}
+            ]
+        }
+        
+        # 定义数据表与输出映射
+        self.finance_tables_map = {
+            'astock_finance_audit': {'output_path': 'market/reference/cn_stock/astock_finance_audit.csv'},
+            'astock_finance_balancesheet': {'output_path': 'market/reference/cn_stock/astock_finance_balancesheet.csv'},
+            'astock_finance_cashflow': {'output_path': 'market/reference/cn_stock/astock_finance_cashflow.csv'},
+            'astock_finance_disclosure_date': {'output_path': 'market/reference/cn_stock/astock_finance_disclosure_date.csv'},
+            'astock_finance_dividend': {'output_path': 'market/reference/cn_stock/astock_finance_dividend.csv'},
+            'astock_finance_express': {'output_path': 'market/reference/cn_stock/astock_finance_express.csv'},
+            'astock_finance_forecast': {'output_path': 'market/reference/cn_stock/astock_finance_forecast.csv'},
+            'astock_finance_income': {'output_path': 'market/reference/cn_stock/astock_finance_income.csv'},
+            'astock_finance_indicator': {'output_path': 'market/reference/cn_stock/astock_finance_indicator.csv'},
+            'astock_finance_mainbz': {'output_path': 'market/reference/cn_stock/astock_finance_mainbz.csv'},
+            'astock_price_daily_basic': {'output_path': 'market/reference/cn_stock/astock_price_daily_basic.csv'}
         }
         
         # 定义数据类型对应的时间格式
@@ -30,22 +81,23 @@ class TushareSaver:
             'cn_index': '%Y-%m-%d 09:30:00+08:00',
             'cn_cb': '%Y-%m-%d 09:30:00+08:00',
             'cn_fund': '%Y-%m-%d 09:30:00+08:00',
+            'cn_future': '%Y-%m-%d 09:30:00+08:00',
             'hk_stock': '%Y-%m-%d 10:00:00+08:00',
             'global_fx': '%Y-%m-%d 00:00:00+08:00'
         }
         
-        self.base_dir = os.path.join(os.getcwd(), "data")
+        self.base_dir = DATA_DIR
         self.freq = "1d"
         self.start_year = 1998  # 历史数据开始年份
         self.current_year = datetime.now().year
         
-    def save_data_to_csv(self):
+    def save_kline_to_csv(self):
         """将数据库中的数据导出到CSV文件，优化版本"""
         try:
-            Log.logger.info("开始导出数据到CSV文件...")
+            Log.logger.info("开始导出K线数据到CSV文件...")
             
             # 使用线程池并行处理不同的表
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(self.table_dataname_map))) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(self.table_dataname_map))) as executor:
                 futures = {executor.submit(self._process_table_optimized, table_name, dataname): (table_name, dataname) 
                           for table_name, dataname in self.table_dataname_map.items()}
                 
@@ -57,6 +109,105 @@ class TushareSaver:
                     except Exception as exc:
                         Log.logger.error(f"处理表 {table_name} 时发生错误: {str(exc)}")
             
+            Log.logger.info("所有K线数据导出完成")
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"K线数据导出过程中发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+    
+    def save_lists_to_csv(self):
+        """将代码列表数据导出到CSV文件"""
+        try:
+            Log.logger.info("开始导出代码列表数据到CSV文件...")
+            
+            # 使用线程池并行处理不同的表
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(self.list_tables_map))) as executor:
+                futures = {executor.submit(self._process_list_table, table_name, config): table_name 
+                          for table_name, config in self.list_tables_map.items()}
+                
+                for future in concurrent.futures.as_completed(futures):
+                    table_name = futures[future]
+                    try:
+                        result = future.result()
+                        Log.logger.info(f"代码列表表 {table_name} 处理完成")
+                    except Exception as exc:
+                        Log.logger.error(f"处理代码列表表 {table_name} 时发生错误: {str(exc)}")
+            
+            Log.logger.info("所有代码列表数据导出完成")
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"代码列表数据导出过程中发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    def save_adj_factors_to_csv(self):
+        """将复权因子数据导出到CSV文件"""
+        try:
+            Log.logger.info("开始导出复权因子数据到CSV文件...")
+            
+            # 使用线程池并行处理不同的表
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(self.adj_tables_map))) as executor:
+                futures = {executor.submit(self._process_adj_table, table_name, config): table_name 
+                          for table_name, config in self.adj_tables_map.items()}
+                
+                for future in concurrent.futures.as_completed(futures):
+                    table_name = futures[future]
+                    try:
+                        result = future.result()
+                        Log.logger.info(f"复权因子表 {table_name} 处理完成")
+                    except Exception as exc:
+                        Log.logger.error(f"处理复权因子表 {table_name} 时发生错误: {str(exc)}")
+            
+            Log.logger.info("所有复权因子数据导出完成")
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"复权因子数据导出过程中发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    def save_calendars_to_csv(self):
+        """将交易日历数据导出到CSV文件"""
+        try:
+            Log.logger.info("开始导出交易日历数据到CSV文件...")
+            
+            # 处理每个交易日历表
+            for table_name, output_configs in self.calendar_tables_map.items():
+                try:
+                    self._process_calendar_table(table_name, output_configs)
+                    Log.logger.info(f"交易日历表 {table_name} 处理完成")
+                except Exception as exc:
+                    Log.logger.error(f"处理交易日历表 {table_name} 时发生错误: {str(exc)}")
+            
+            Log.logger.info("所有交易日历数据导出完成")
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"交易日历数据导出过程中发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    def save_table_data_to_csv(self):
+        """将数据表导出到CSV文件"""
+        try:
+            Log.logger.info("开始导出数据到CSV文件...")
+            
+            # 使用线程池并行处理不同的表
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(self.finance_tables_map))) as executor:
+                futures = {executor.submit(self._process_finance_table, table_name, config): table_name 
+                          for table_name, config in self.finance_tables_map.items()}
+                
+                for future in concurrent.futures.as_completed(futures):
+                    table_name = futures[future]
+                    try:
+                        result = future.result()
+                        Log.logger.info(f"表 {table_name} 处理完成")
+                    except Exception as exc:
+                        Log.logger.error(f"处理表 {table_name} 时发生错误: {str(exc)}")
+            
             Log.logger.info("所有数据导出完成")
             return True
             
@@ -64,14 +215,314 @@ class TushareSaver:
             Log.logger.error(f"数据导出过程中发生错误: {str(e)}")
             Log.logger.error(traceback.format_exc())
             return False
-    
+
+    def _process_list_table(self, table_name, config):
+        """处理单个代码列表表"""
+        try:
+            # 验证表是否存在
+            if not DB.table_exists(table_name, self.db):
+                Log.logger.warning(f"表 {table_name} 不存在，跳过")
+                return False
+                
+            # 获取输出路径
+            output_path = config['output_path']
+            output_file = os.path.join(self.base_dir, output_path)
+            
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            
+            # 检查是否存在CSV文件，以及是否可以进行增量更新
+            max_date = None
+            condition = ""
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                try:
+                    # 读取现有CSV文件，检查是否有trade_date列
+                    existing_df = pd.read_csv(output_file)
+                    if 'trade_date' in existing_df.columns and not existing_df.empty:
+                        max_date = existing_df['trade_date'].max()
+                        if pd.notna(max_date):
+                            condition = f" WHERE trade_date > '{max_date}'"
+                            Log.logger.info(f"发现现有文件 {output_file}，将只查询 {max_date} 之后的数据")
+                except Exception as e:
+                    Log.logger.warning(f"读取现有CSV文件时发生错误，将执行全量导出: {str(e)}")
+            
+            # 查询数据
+            Log.logger.info(f"查询表 {table_name} 的代码列表数据...")
+            
+            # 查询语句，根据是否有最大日期构建不同的SQL
+            sql = f"SELECT * FROM {table_name}{condition}"
+            df = DB.select_to_df(sql, self.db)
+            
+            if df.empty:
+                Log.logger.info(f"表 {table_name} 没有新数据需要更新")
+                return True  # 没有新数据也算成功
+            
+            # 根据表名处理特定的映射逻辑
+            processed_df = self._process_list_dataframe(df, table_name, config)
+            
+            # 保存数据到CSV
+            mode = 'a' if max_date is not None else 'w'  # 如果是增量更新则追加模式，否则覆盖模式
+            header = not (max_date is not None and os.path.exists(output_file))  # 增量更新不需要表头
+            processed_df.to_csv(output_file, index=False, mode=mode, header=header)
+            
+            Log.logger.info(f"已{'追加' if mode == 'a' else '保存'}代码列表数据到 {output_file}")
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"处理代码列表表 {table_name} 时发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    def _process_adj_table(self, table_name, config):
+        """处理单个复权因子表"""
+        try:
+            # 验证表是否存在
+            if not DB.table_exists(table_name, self.db):
+                Log.logger.warning(f"表 {table_name} 不存在，跳过")
+                return False
+                
+            # 获取输出路径
+            output_path = config['output_path']
+            output_file = os.path.join(self.base_dir, output_path)
+            
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            
+            # 查询数据
+            Log.logger.info(f"查询表 {table_name} 的复权因子数据...")
+            
+            # 查询语句
+            sql = f"SELECT * FROM {table_name}"
+            df = DB.select_to_df(sql, self.db)
+            
+            if df.empty:
+                Log.logger.warning(f"表 {table_name} 没有数据")
+                return False
+            
+            # 重命名列
+            if 'ts_code' in df.columns:
+                df.rename(columns={'ts_code': 'code'}, inplace=True)
+            if 'trade_date' in df.columns:
+                df.rename(columns={'trade_date': 'date'}, inplace=True)
+            
+            # 保存数据到CSV
+            self._save_csv(df, output_file, header=True)
+            
+            Log.logger.info(f"已保存复权因子数据到 {output_file}")
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"处理复权因子表 {table_name} 时发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    def _process_calendar_table(self, table_name, output_configs):
+        """处理单个交易日历表，支持多个输出位置"""
+        try:
+            # 验证表是否存在
+            if not DB.table_exists(table_name, self.db):
+                Log.logger.warning(f"表 {table_name} 不存在，跳过")
+                return False
+                
+            # 查询数据
+            Log.logger.info(f"查询表 {table_name} 的交易日历数据...")
+            
+            # 查询语句
+            sql = f"SELECT * FROM {table_name}"
+            df = DB.select_to_df(sql, self.db)
+            
+            if df.empty:
+                Log.logger.warning(f"表 {table_name} 没有数据")
+                return False
+            
+            # 处理各个输出配置
+            for config in output_configs:
+                output_path = config['output_path']
+                output_file = os.path.join(self.base_dir, output_path)
+                
+                # 确保输出目录存在
+                os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                
+                # 复制数据框以避免修改原始数据
+                processed_df = df.copy()
+                
+                # 是否需要添加exchange列
+                if 'add_exchange' in config:
+                    processed_df['exchange'] = config['add_exchange']
+                
+                # 保存数据到CSV
+                self._save_csv(processed_df, output_file, header=True)
+                
+                Log.logger.info(f"已保存交易日历数据到 {output_file}")
+            
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"处理交易日历表 {table_name} 时发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    def _process_finance_table(self, table_name, config):
+        """处理单个数据表"""
+        try:
+            # 验证表是否存在
+            if not DB.table_exists(table_name, self.db):
+                Log.logger.warning(f"表 {table_name} 不存在，跳过")
+                return False
+                
+            # 获取输出路径
+            output_path = config['output_path']
+            output_file = os.path.join(self.base_dir, output_path)
+            
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            
+            # 查询数据
+            Log.logger.info(f"查询表 {table_name} 的数据...")
+            
+            # 查询语句
+            sql = f"SELECT * FROM {table_name}"
+            df = DB.select_to_df(sql, self.db)
+            
+            if df.empty:
+                Log.logger.warning(f"表 {table_name} 没有数据")
+                return False
+            
+            # 如果ts_code列存在，重命名为code
+            if 'ts_code' in df.columns:
+                df.rename(columns={'ts_code': 'code'}, inplace=True)
+            
+            # 保存数据到CSV
+            self._save_csv(df, output_file, header=True)
+            
+            Log.logger.info(f"已保存数据到 {output_file}")
+            return True
+            
+        except Exception as e:
+            Log.logger.error(f"处理表 {table_name} 时发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return False
+
+    def _process_list_dataframe(self, df, table_name, config):
+        """根据表名处理代码列表数据框的映射"""
+        try:
+            # 创建新的DataFrame
+            new_df = pd.DataFrame()
+            
+            # 基础列
+            new_df['code'] = df['ts_code'] if 'ts_code' in df.columns else ''
+            new_df['name'] = df['name'] if 'name' in df.columns else ''
+            
+            # 填充固定值
+            new_df['region'] = config['region']
+            new_df['type'] = config['type']
+            
+            # 根据表名特殊处理
+            if table_name == 'astock_basic':
+                new_df['exchange'] = df['exchange']
+                new_df['market'] = df['market']
+                new_df['category'] = df['market']
+                new_df['list_date'] = df['list_date']
+                new_df['delist_date'] = df['delist_date']
+                new_df['ext_1'] = ''
+                new_df['ext_2'] = ''
+
+            elif table_name == 'astock_namechange':
+                # 名称变更历史：保留 name/start_date/end_date/change_reason（按日精确 ST 的数据源）
+                new_df['start_date'] = df['start_date'] if 'start_date' in df.columns else ''
+                new_df['end_date'] = df['end_date'] if 'end_date' in df.columns else ''
+                new_df['change_reason'] = df['change_reason'] if 'change_reason' in df.columns else ''
+
+            elif table_name == 'astock_index_basic':
+                new_df['exchange'] = df['market']
+                new_df['market'] = df['market']
+                new_df['category'] = ''
+                new_df['list_date'] = df['list_date'] if 'list_date' in df.columns else ''
+                new_df['delist_date'] = df['exp_date'] if 'exp_date' in df.columns else ''
+                new_df['ext_1'] = ''
+                new_df['ext_2'] = ''
+                
+            elif table_name == 'cb_basic':
+                new_df['exchange'] = df['exchange'].str.replace('SH', 'SSE').str.replace('SZ', 'SZSE')
+                new_df['market'] = df['exchange']
+                new_df['category'] = ''
+                new_df['list_date'] = df['list_date']
+                new_df['delist_date'] = df['delist_date']
+                new_df['ext_1'] = ''
+                new_df['ext_2'] = ''
+                
+            elif table_name == 'fund_basic':
+                new_df['exchange'] = df['exchange'] if 'exchange' in df.columns else ''
+                new_df['market'] = df['market'] if 'market' in df.columns else 'E'
+                new_df['category'] = ''
+                new_df['list_date'] = df['list_date'].fillna(df['purc_startdate']) if 'list_date' in df.columns and 'purc_startdate' in df.columns else ''
+                new_df['delist_date'] = df['delist_date'] if 'delist_date' in df.columns else ''
+                new_df['ext_1'] = ''
+                new_df['ext_2'] = ''
+                
+            elif table_name == 'futures_basic':
+                new_df['exchange'] = df['exchange']
+                new_df['market'] = ''
+                # 从code提取类别
+                import re
+                def extract_category(code):
+                    match = re.match(r'([a-zA-Z]+)', code)
+                    return match.group(1) if match else ''
+                new_df['category'] = new_df['code'].apply(extract_category)
+                new_df['list_date'] = df['list_date']
+                new_df['delist_date'] = df['delist_date']
+                new_df['ext_1'] = ''
+                new_df['ext_2'] = ''
+                
+            elif table_name == 'fx_basic':
+                new_df['exchange'] = df['exchange']
+                new_df['market'] = ''
+                new_df['category'] = df['classify']
+                new_df['list_date'] = ''
+                new_df['delist_date'] = ''
+                new_df['ext_1'] = ''
+                new_df['ext_2'] = ''
+                
+            elif table_name == 'hk_basic':
+                new_df['exchange'] = 'HKEX'
+                new_df['market'] = df['market']
+                new_df['category'] = df['market']
+                new_df['list_date'] = df['list_date']
+                new_df['delist_date'] = df['delist_date']
+                new_df['ext_1'] = df['isin'] if 'isin' in df.columns else ''
+                new_df['ext_2'] = ''
+                
+            # namechange 用自己的列结构（保留 start_date/end_date/change_reason，按日精确 ST 的数据源）
+            if table_name == 'astock_namechange':
+                nc_cols = ['code', 'name', 'start_date', 'end_date', 'change_reason']
+                for col in nc_cols:
+                    if col not in new_df.columns:
+                        new_df[col] = ''
+                return new_df[nc_cols]
+
+            # 确保所有必要的列都存在
+            required_columns = ['code', 'name', 'region', 'exchange', 'market', 'type', 'category', 'list_date', 'delist_date', 'ext_1', 'ext_2']
+            for col in required_columns:
+                if col not in new_df.columns:
+                    new_df[col] = ''
+
+            # 设置列顺序
+            new_df = new_df[required_columns]
+
+            return new_df
+            
+        except Exception as e:
+            Log.logger.error(f"处理代码列表数据框时发生错误: {str(e)}")
+            Log.logger.error(traceback.format_exc())
+            return pd.DataFrame()
+
     def _process_table_optimized(self, table_name, dataname):
         """优化的单表处理方法，分别处理codebased和timebased数据"""
         try:
             Log.logger.info(f"开始处理表 {table_name}...")
             
             # 验证表是否存在
-            if not mydb.tableExists(table_name, self.db):
+            if not DB.table_exists(table_name, self.db):
                 Log.logger.warning(f"表 {table_name} 不存在，跳过")
                 return False
                 
@@ -123,7 +574,7 @@ class TushareSaver:
                 """
                 
                 Log.logger.info(f"查询 {year} 年 {table_name} 表数据...")
-                df = mydb.selectToDf(sql, self.db)
+                df = DB.select_to_df(sql, self.db)
                 
                 if df.empty:
                     Log.logger.warning(f"{year} 年 {table_name} 表没有数据")
@@ -148,14 +599,8 @@ class TushareSaver:
                     for code, code_df in code_groups:
                         # 构建文件路径
                         code_file = os.path.join(year_dir, f"{code}.csv")
-                        
-                        # 如果是当前年份且文件已存在，先删除
-                        if year == self.current_year and os.path.exists(code_file):
-                            try:
-                                os.remove(code_file)
-                            except Exception as e:
-                                Log.logger.warning(f"删除文件失败: {code_file}, 错误: {str(e)}")
-                        
+                        # _save_csv 已改为原子 os.replace 覆盖，无需预先删除（原"先删后写"有空窗风险）
+
                         # 提交保存任务
                         futures.append(executor.submit(
                             self._save_csv, code_df, code_file, sort=True, sort_by=['time']))
@@ -204,7 +649,7 @@ class TushareSaver:
                 """
             
             Log.logger.info(f"查询 {table_name} 表最新数据...")
-            df = mydb.selectToDf(sql, self.db)
+            df = DB.select_to_df(sql, self.db)
             
             if df.empty:
                 Log.logger.warning(f"{table_name} 表没有最新数据")
@@ -234,7 +679,7 @@ class TushareSaver:
                 day_df = group.drop(columns=['date'], errors='ignore')
                 
                 # 保存数据
-                self._save_csv(day_df, source_file)
+                #self._save_csv(day_df, source_file)
                 self._save_csv(day_df, merged_file)
                 
                 Log.logger.info(f"已保存 {date} 的timebased数据到 {source_file}")
@@ -367,7 +812,15 @@ class TushareSaver:
             
             # 确保列顺序正确
             new_df = new_df[columns]
-            
+
+            # 丢弃无 OHLC 的行：tushare 对当日无成交的合约返回 NULL OHLC(仅有结算价),
+            # 这些行对 OHLCV 回测无用且会产生 NaN。对每天都有成交的市场(如A股)无影响。
+            before = len(new_df)
+            new_df = new_df.dropna(subset=['open', 'high', 'low', 'close'])
+            dropped = before - len(new_df)
+            if dropped > 0:
+                Log.logger.info(f"{dataname}: 丢弃 {dropped} 行无OHLC数据(无成交日, {before}→{len(new_df)})")
+
             return new_df
             
         except Exception as e:
@@ -375,19 +828,34 @@ class TushareSaver:
             Log.logger.error(traceback.format_exc())
             return pd.DataFrame()
     
-    def _save_csv(self, df, filepath, sort=False, sort_by=None):
-        """优化的保存CSV文件方法"""
+    def _save_csv(self, df, filepath, sort=False, sort_by=None, header=False):
+        """优化的保存CSV文件方法（原子写：tmp→fsync→os.replace）"""
+        import tempfile
         try:
             # 避免修改原始数据
             df = df.copy()
-            
+
             # 排序
             if sort and sort_by:
                 df = df.sort_values(sort_by)
-            
-            # 保存文件
-            df.to_csv(filepath, index=False, header=False)
-                
+
+            # 原子保存：临时文件同目录 → fsync → os.replace（覆盖已存在文件，无空窗）
+            dirname = os.path.dirname(os.path.abspath(filepath)) or '.'
+            fd, tmp = tempfile.mkstemp(dir=dirname, prefix='.awcsv_', suffix='.tmp')
+            try:
+                os.close(fd)
+                df.to_csv(tmp, index=False, header=header)
+                with open(tmp, 'rb') as f:
+                    os.fsync(f.fileno())
+                os.chmod(tmp, 0o644)  # mkstemp默认0600, 改0644让回测等其它用户可读
+                os.replace(tmp, filepath)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+
         except Exception as e:
             Log.logger.error(f"保存文件 {filepath} 时发生错误: {str(e)}")
             Log.logger.error(traceback.format_exc())
@@ -396,4 +864,4 @@ class TushareSaver:
 def save_tushare_data():
     """提供给外部调用的保存函数"""
     saver = TushareSaver()
-    return saver.save_data_to_csv()
+    return saver.save_kline_to_csv()

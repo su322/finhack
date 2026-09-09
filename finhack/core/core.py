@@ -6,7 +6,7 @@ import importlib
 import inspect
 import finhack.library.log as Log
 from finhack.library.utils import Utils
-from finhack.library.class_loader import ClassLoader
+from finhack.core.loader.class_loader import ClassLoader
 from finhack.core.version import get_version
 import sys
 
@@ -56,15 +56,17 @@ class Core:
         from runtime.constant import LOGS_DIR
         vendor="default" if self.args.vendor is None else self.args.vendor
         action="run" if self.args.action is None else self.args.action
-        Log.logger=Log.Log(module=self.args.module,vendor=vendor,action=action,logs_dir=LOGS_DIR,background=self.args.background).logger
+        # 从参数中获取日志级别，默认为INFO
+        log_level = getattr(self.args, 'log_level', 'INFO') if hasattr(self.args, 'log_level') else 'INFO'
+        Log.logger=Log.Log(module=self.args.module,vendor=vendor,action=action,logs_dir=LOGS_DIR,background=self.args.background,level=log_level).logger
         
     #追加配置文件中的参数
     def append_args(self):
         sys.path.append(self.project_path)
         sys.path.append(self.project_path+'/data/cache/')
-        from finhack.library.config import Config 
+        from finhack.library.config import Config
 
-        
+
         #待添加的args列表
         args_list={
 
@@ -72,14 +74,33 @@ class Core:
 
         #读取args文件下所有分区
         my_args_group_list=Config.get_section_list('args')
-        args, unknown = self.parser.parse_known_args()
+        # 移除 argv 的 key=value（含=），避免被 argparse 当 module/action 位置参数
+        _kv = [a for a in sys.argv[1:] if '=' in a and not a.startswith('-')]
+        _argv = [a for a in sys.argv[1:] if a not in _kv]
+        args, unknown = self.parser.parse_known_args(_argv)
+
+        # 处理命令行传递的额外参数（支持 key=value 格式）
+        # 保存命令行参数，用于后续覆盖配置文件参数
+        cmdline_args = {}
+        for arg_str in _kv:
+            if '=' in arg_str:
+                key, value = arg_str.split('=', 1)
+                # 移除开头的 --（如果有）
+                key = key.lstrip('-')
+                cmdline_args[key] = value
+
+        print(f"[append_args] sys.argv={sys.argv}", flush=True)
+        print(f"[append_args] unknown={unknown}", flush=True)
+        print(f"[append_args] cmdline_args={cmdline_args}", flush=True)
 
         #[global]
         for my_args_group in my_args_group_list:
             if my_args_group=='global':
                 my_args_list=Config.get_config('args',my_args_group)
                 for arg,default in my_args_list.items():
-                    args_list[arg]=default
+                    # 只有命令行没有指定时，才使用配置文件的值
+                    if arg not in cmdline_args:
+                        args_list[arg]=default
 
         vendor="default" if args.vendor is None else args.vendor
         #[model]
@@ -87,42 +108,69 @@ class Core:
             if my_args_group==args.module:
                 my_args_list=Config.get_config('args',my_args_group)
                 for arg,default in my_args_list.items():
-                    args_list[arg]=default
+                    if arg not in cmdline_args:
+                        args_list[arg]=default
 
         #[model-vendor]
         for my_args_group in my_args_group_list:
             if my_args_group==args.module+'-'+vendor:
                 my_args_list=Config.get_config('args',my_args_group)
                 for arg,default in my_args_list.items():
-                    args_list[arg]=default
+                    if arg not in cmdline_args:
+                        args_list[arg]=default
 
         #[model-vendor-action]
         for my_args_group in my_args_group_list:
             if my_args_group==args.module+'-'+vendor+'-'+args.action:
                 my_args_list=Config.get_config('args',my_args_group)
                 for arg,default in my_args_list.items():
-                    args_list[arg]=default
+                    if arg not in cmdline_args:
+                        args_list[arg]=default
 
         #model.conf [args]
         my_args_list=Config.get_config(args.module,'args')
         for arg,default in my_args_list.items():
-            args_list[arg]=default
+            if arg not in cmdline_args:
+                args_list[arg]=default
 
 
         #model.conf [args.section]
         if args.section!=None and args.section!='':
             my_args_list=Config.get_config(args.module,args.section)
             for arg,default in my_args_list.items():
-                args_list[arg]=default
+                if arg not in cmdline_args:
+                    args_list[arg]=default
+
+        # 添加命令行参数（优先级最高）
+        for key, value in cmdline_args.items():
+            args_list[key] = value
+
+        # 调试：args_list中freq/cash/strategy的值
+        for debug_key in ['freq', 'cash', 'strategy', 'market']:
+            if debug_key in args_list:
+                print(f"[append_args] args_list['{debug_key}']={args_list[debug_key]}", flush=True)
 
 
         for arg,default in args_list.items():
                 group = self.parser.add_argument_group(my_args_group)
                 group.add_argument('--'+arg,metavar='', default=default)
-        args=self.parse_args()
+        args=self.parse_args(_argv)
+
+        # 【关键】手动设置命令行参数到args对象
+        # 因为parse_args只处理--key value格式，不处理key=value格式
+        for key, value in cmdline_args.items():
+            setattr(args, key, value)
+
+        # 将cmdline_args存储到args对象中，供下游代码直接使用
+        args._cmdline_args = cmdline_args
+
+        # 调试：最终args值
+        for debug_key in ['freq', 'cash', 'strategy']:
+            print(f"[append_args] 最终 args.{debug_key}={getattr(args, debug_key, 'NOT_SET')}", flush=True)
+
         self.args=args
-        
-        import runtime.global_var as global_var 
+
+        import runtime.global_var as global_var
         global_var.args=args
         
         
@@ -139,6 +187,18 @@ class Core:
 
         
         
+    @staticmethod
+    def _atomic_write(path, content):
+        # 并行启动多个回测进程时，直接 open(path,'w') 会互相截断同一份生成的
+        # constant.py / global_var.py，导致其它进程在 import 时读到写了一半的文件
+        # （典型现象：ImportError: cannot import name 'LOGS_DIR'）。
+        # 改为先写临时文件再 os.replace 原子替换，保证磁盘上的文件始终完整可用。
+        # 临时文件名带 pid，避免多进程共用同一 tmp 名导致互相 os.replace 抢占失败。
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, 'w') as f:
+            f.write(content)
+        os.replace(tmp, path)
+
     def refresh_runtime(self):
         project_path=self.project_path
         constant=''
@@ -146,16 +206,14 @@ class Core:
             constant = f.read()
             constant=constant.replace('{BASE_DIR}','"'+project_path+'"')
             constant=constant.replace('{FRAMEWORK_DIR}','"'+Utils.get_framework_path()+'"')
-        with open(project_path+"/data/cache/runtime/constant.py", 'w') as f:
-            f.write(constant)
-        
+        self._atomic_write(project_path+"/data/cache/runtime/constant.py", constant)
+
         global_var=''
         with open(project_path+"/data/config/global_var.conf", 'r') as f:
             global_var = f.read()
             global_var=global_var.replace('{BASE_DIR}','"'+project_path+'"')
             global_var=global_var.replace('{FRAMEWORK_DIR}','"'+Utils.get_framework_path()+'"')
-        with open(project_path+"/data/cache/runtime/global_var.py", 'w') as f:
-            f.write(global_var)               
+        self._atomic_write(project_path+"/data/cache/runtime/global_var.py", global_var)
         
     
     def check_project(self):
@@ -190,28 +248,172 @@ class Core:
             project_path=os.getcwd()
         project_file=project_path+"/.proj"
         if not os.path.exists(project_file):
-            print("当前目录非项目目录，请使用-p参数指定项目路径，或使用create命令创建项目")
+            print("当前目录非项目目录，请切换到项目目录下执行命令，或使用-p参数指定项目路径，若未创建项目，请使用create命令创建项目！\n")
+            exit()
         self.project_path=project_path
     
     
     #生成参数
     def generate_args(self):
-        parser = argparse.ArgumentParser(description='',usage=self.usage)
+        # 检查是否无参数，直接显示帮助信息
+        if len(sys.argv) == 1:
+            print(self.usage)
+            sys.exit(0)
+
+        # 检查是否有 -h/--help 参数（在解析前检查）
+        if '-h' in sys.argv or '--help' in sys.argv:
+            self._show_full_help()
+            sys.exit(0)
+
+        parser = argparse.ArgumentParser(description='',usage=self.usage, add_help=False)
         parser.add_argument('module', help='需要调用的模块')
-        parser.add_argument('action', help='需要执行的动作')
+        parser.add_argument('action', nargs='?', default='run', help='需要执行的动作（默认: run）')
         parser.add_argument("--background",  default=False, action='store_true', help="是否在后台运行")
         parser.add_argument('--project_path',metavar='', help='项目路径')
         parser.add_argument("--vendor",  metavar='',  help="模块的供给侧")
         parser.add_argument("--section",  metavar='',  help="配置文件section")
+
+        # 解析参数
+        args, unknown = parser.parse_known_args()
+
         self.parser=parser
+        self.args=args
         return parser
         
     
-    #生成参数
-    def parse_args(self):
-        args, unknown = self.parser.parse_known_args() 
-        self.args=args
+    #重新解析参数（动态注册了新的--key参数后需要重新解析）
+    def parse_args(self, argv=None):
+        args, unknown = self.parser.parse_known_args(argv)
+        self.args = args
         return args
+
+    def _show_full_help(self):
+        """显示完整的帮助信息"""
+        full_help = """
+FinHack 量化框架 - 完整命令帮助
+
+用法: finhack {module} {action} [参数...]
+
+全局参数:
+  --vendor={vendor}      模块供应商 (如: tushare, lightgbm, backtest等)
+  --background           后台运行
+  --project_path={path}  项目路径
+  --section={section}    配置文件section
+  --log_level={level}    日志级别 (DEBUG/INFO/WARNING/ERROR)
+
+================================
+项目模块 (project)
+================================
+finhack project create --project_path={project_path}    # 创建新项目
+finhack project renew                                   # 更新项目结构
+
+================================
+数据采集模块 (collector)
+================================
+finhack collector run --vendor=tushare                  # 采集tushare数据
+finhack collector fix --vendor=tushare                  # 修复数据缺失和异常
+finhack collector fix --vendor=tushare --start_date=20250601 --end_date=20250630
+finhack collector fix --vendor=tushare --auto=true      # 自动修复质量异常数据
+finhack collector stop --vendor=tushare                  # 停止采集
+finhack collector save --vendor=tushare                  # 导出数据到CSV
+finhack collector count --vendor=tushare                 # 数据库统计
+
+================================
+检查模块 (check)
+================================
+finhack check                                           # 检查全部（data, cache, factors）
+finhack check --target=all                              # 检查全部
+finhack check --target=data,cache                       # 检查数据和缓存
+finhack check --target=data                             # 只检查数据
+finhack check --target=cache                            # 只检查缓存
+finhack check --target=factors                          # 只检查因子
+
+================================
+定时任务管理 (cron) —— 扫描/状态/手动运行/增删
+================================
+finhack cron list                                       # 扫描 root crontab + /etc/cron.d, 显示项目相关任务(含运行状态)
+finhack cron list all=true                              # 显示全部(含非项目)
+finhack cron run id=N                                   # 手动运行第 N 个任务
+finhack cron add schedule='0 2 * * *' cmd='cd /mnt/... && ./x.sh' to=cron.d  # 新增(to=cron.d 或 root)
+finhack cron rm id=N                                    # 删除第 N 个任务
+
+================================
+K线模块 (kline)
+================================
+finhack kline cache                                     # K线数据缓存（默认所有市场、所有频率）
+finhack kline cache --market=cn_stock                   # 缓存指定市场
+finhack kline cache --freq=1m                           # 缓存指定频率
+finhack kline cache --year=2024                         # 缓存指定年份
+finhack kline cache --force=true                        # 强制重建缓存（忽略文件时间）
+finhack kline cache --market=all --freq=all             # 显式指定所有市场和频率
+finhack kline stop                                      # 停止任务
+
+================================
+因子模块 (factor)
+================================
+finhack factor run                                      # 计算所有因子
+finhack factor list                                     # 查看可用因子列表
+finhack factor show --factor=pe_0                       # 查看因子信息
+finhack factor analys --factor=pe_0                     # 分析因子
+finhack factor analys_all                               # 分析所有因子
+finhack factor compute --code=002624.sz --factor=rimv_0 # 单个股票因子计算
+finhack factor mining --method=gplearn                  # 使用gplearn因子挖掘
+finhack factor mining --method=chatgpt --prompt=autoalpha --model=gpt-4-1106-preview
+finhack factor calc --formula="close/open"              # 计算自定义公式
+
+================================
+交易模块 (trader)
+================================
+# 回测 (vendor=backtest)
+finhack trader run --vendor=backtest --strategy=demoStrategy
+finhack trader run --vendor=backtest --strategy=demoStrategy \\
+  --start_time=2024-01-01 --end_time=2024-12-31 --cash=1000000
+
+# 模拟交易 (vendor=sim)
+finhack trader run --vendor=sim --strategy=demoStrategy
+
+# 实盘交易 (vendor=qmt/miniqmt)
+finhack trader run --vendor=qmt --strategy=demoStrategy
+finhack trader run --vendor=miniqmt --strategy=demoStrategy
+
+# 其他
+finhack trader show --id={instance_id}                  # 显示回测结果
+finhack trader auto                                    # 自动交易(多进程)
+
+================================
+模型训练模块 (trainer)
+================================
+finhack trainer auto --vendor=lightgbm                  # 自动训练lightgbm
+finhack trainer run --vendor=lightgbm --market=cn_stock --freq=1d \\
+  --start_date=20200101 --valid_date=20210101 --end_date=20220101
+
+================================
+Web 服务模块 (server)
+================================
+finhack server run port=5055                               # 启动 Flask server + dashboard
+# 浏览器打开 http://localhost:5055/dashboard → 因子管理/分析/ML训练/回测/数据管理
+
+================================
+常用流程
+================================
+# 数据采集
+finhack collector run --vendor=tushare
+finhack collector fix --vendor=tushare --auto=true
+
+# 数据检查
+finhack check --target=data,cache                       # 检查数据和缓存完整性
+
+# 因子计算
+finhack factor run
+finhack factor analys --factor=pe_0
+
+# 训练与回测
+finhack trainer auto --vendor=lightgbm
+finhack trader run --vendor=backtest --strategy=xxx --model_id={hash}
+
+更多文档: https://github.com/FinHackCN/FinHack
+"""
+        print(full_help)
         
         
     def load_module(self):

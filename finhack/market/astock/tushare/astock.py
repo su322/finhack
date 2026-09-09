@@ -11,9 +11,11 @@ import threading
 # 股票信息获取模块
 from datetime import timedelta
 from runtime.constant import *
-from finhack.library.mydb import mydb
+from finhack.library.db import DB  # 替换为统一的DB类
 from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor, wait, ALL_COMPLETED
 
+# 设置pandas选项，适应未来行为
+pd.set_option('future.no_silent_downcasting', True)
 
 
 def getStockCodeList(strict=True,db='tushare'):
@@ -23,10 +25,10 @@ def getStockCodeList(strict=True,db='tushare'):
         else:
             sql = "select ts_code from astock_basic;"
         try:
-            df_code=mydb.selectToDf(sql,'tushare')
+            df_code=DB.select_to_df(sql, db)  # 使用DB类替代mydb
             return df_code
         except Exception as e:
-            print("MySQL getStockCodeList Error:%s" % str(e))  
+            print(f"获取股票代码列表错误: {str(e)}")  
             return False
             
             
@@ -45,10 +47,10 @@ def getIndexMember(index='000300.SH',trade_date='20221031'):
         
         
         try:
-            df=mydb.selectToDf(sql,'tushare')
+            df=DB.select_to_df(sql, 'tushare')  # 使用DB类替代mydb
             return df['con_code'].tolist()
         except Exception as e:
-            print("MySQL getStockCodeList Error:%s" % str(e))  
+            print(f"获取指数成分错误: {str(e)}")  
             return False        
             
     
@@ -62,10 +64,8 @@ def getIndexPrice(ts_code='000300.SH',start_date=None,end_date=None):
         
         sql = "select * from astock_index_daily where ts_code='%s' %s %s order by trade_date asc" % (ts_code,c1,c2)
         
-        #print(sql)
-        
         try:
-            df=mydb.selectToDf(sql,'tushare')
+            df=DB.select_to_df(sql, 'tushare')  # 使用DB类替代mydb
             df["open"]=df["open"].astype(float)
             df["high"]=df["high"].astype(float)
             df["low"]=df["low"].astype(float)
@@ -77,7 +77,7 @@ def getIndexPrice(ts_code='000300.SH',start_date=None,end_date=None):
             df['amount']=df['amount'].astype(float)
             return df
         except Exception as e:
-            print("MySQL getStockCodeList Error:%s" % str(e))  
+            print(f"获取指数价格错误: {str(e)}")  
             return False   
         return df    
     
@@ -86,7 +86,7 @@ def getIndexPrice(ts_code='000300.SH',start_date=None,end_date=None):
     
 def getTableDataByCode(table,ts_code,where="",db='tushare'):
         sql="select * from "+table+" where ts_code='"+ts_code+"' "+where
-        result=mydb.select(sql,'tushare')
+        result=DB.select(sql, db)  # 使用DB类替代mydb
         df_date = pd.DataFrame(list(result))
         df_date=df_date.reset_index(drop=True)
         return df_date
@@ -95,7 +95,7 @@ def getTableDataByCode(table,ts_code,where="",db='tushare'):
 def getTableData(table,where="",db='tushare'):
         sql="select * from "+table+" where 1=1 "+where
         #print(sql)
-        result=mydb.select(sql,'tushare')
+        result=DB.select(sql, db)  # 使用DB类替代mydb
         df_date = pd.DataFrame(list(result))
         df_date=df_date.reset_index(drop=True)
         return df_date    
@@ -405,73 +405,208 @@ def getStockDailyPriceByCode(code,where="",startdate='',enddate='',fq='hfq',db='
         
        
         
-def alignStockFactors(df,table,date,filed,conv=0,db='tushare'):
-        df=df.copy()
-        if 'level_0' in df.columns:
-            df = df.drop(columns=['level_0'])
-        df=df.reset_index()
-        ts_code=df['ts_code'].tolist()[0]
-        df.drop_duplicates('trade_date',inplace = True)
- 
-        
-        if(filed=='*'):
-            df_factor=mydb.selectToDf("select * from "+table+" where ts_code='"+ts_code+"'",db)
-            filed=mydb.selectToDf("select COLUMN_NAME from information_schema.COLUMNS where table_name = '"+table+"'",db)
-            filed=filed['COLUMN_NAME'].tolist()
-            filed=",".join(filed)
-        else:
-            df_factor=mydb.selectToDf("select "+date+","+filed+" from "+table+" where ts_code='"+ts_code+"'",db)
-        
-        
-        if isinstance(df_factor, bool) or df_factor.empty:
-            return pd.DataFrame()
-        
-        #去重
+def alignStockFactors(df, table, date, filed, conv=0, max_workers=10,db=None):
+    # 保存原始索引结构以便后续恢复
+    has_multi_index = isinstance(df.index, pd.MultiIndex)
+    original_index = df.index.copy()
+    
+    # 复制一份 DataFrame 防止修改原始数据
+    df = df.copy()
+    
+    # 处理多级索引，将索引重置为列
+    df = df.reset_index()
+    
+    
+    # 将 time 转换为 trade_date
+    if 'time' in df.columns:
+        df['trade_date'] = df['time'].dt.strftime('%Y%m%d')
+    
+    # 确保trade_date列为字符串类型
+    df['trade_date'] = df['trade_date'].astype(str)
+    
+    # 检查可能的 level_0 列 (通常由 reset_index 引入)
+    if 'level_0' in df.columns:
+        df = df.drop(columns=['level_0'])
+    
+    # 获取唯一的 ts_code 列表
+    ts_codes = df['code'].unique().tolist()
+    
+    # 从CSV文件加载数据
+    csv_data = None
+    try:
+        csv_path = f"{DATA_DIR}/market/reference/cn_stock/{table}.csv"
+        csv_data = pd.read_csv(csv_path)
+        # 确保所有字符串类型的列没有前后空格
+        for col in csv_data.select_dtypes(include=['object']).columns:
+            csv_data[col] = csv_data[col].str.strip()
+        print(f"成功加载CSV数据: {csv_path}, 共{len(csv_data)}行")
+    except Exception as e:
+        print(f"加载CSV数据失败: {str(e)}")
+        return df  # 如果无法加载CSV数据，返回原始DataFrame
+    
+    # 定义处理单个股票的函数
+    # 【性能修复】原实现每股执行 csv_data[csv_data['code']==code]，对 17M 行 CSV
+    # 逐股全表扫描（O(行数×股票数)，2014-2017 回填时单年需数小时）。
+    # 预先按 code 分组一次，单股取数 O(1)。
+    csv_groups = {code: g for code, g in csv_data.groupby('code', sort=False)}
+    df_groups = {code: g for code, g in df.groupby('code', sort=False)}
+    def process_single_stock(code):
         try:
-            df_factor = df_factor[~df_factor[date].duplicated()]
+            # 筛选当前股票的数据
+            df_single = df_groups[code].copy()
+            df_single.drop_duplicates('trade_date', inplace=True)
+
+            # 从CSV数据中筛选
+            df_factor = (csv_groups[code] if code in csv_groups else csv_data.iloc[0:0]).copy()
+            
+            # 如果用户指定了特定字段
+            if filed != '*':
+                fields_list = [f.strip() for f in filed.split(',') if f.strip()]
+                if date not in fields_list:
+                    fields_list.append(date)
+                if 'code' not in fields_list:
+                    fields_list.append('code')
+                # 只保留需要的列
+                available_cols = [col for col in fields_list if col in df_factor.columns]
+                df_factor = df_factor[available_cols]
+            
+            # 检查是否成功获取因子数据
+            if df_factor is None or df_factor.empty:
+                # 处理未获取到数据的情况
+                if filed == '*':
+                    # 如果是读取所有字段，为每个字段创建空值列
+                    for col in csv_data.columns:
+                        if col not in df_single.columns:
+                            df_single[col] = None
+                elif filed != '*':
+                    # 为指定的字段创建空值列
+                    fields_list = [f.strip() for f in filed.split(',') if f.strip()]
+                    for f in fields_list:
+                        if f != date and f != 'code' and f not in df_single.columns:
+                            df_single[f] = None
+                return df_single
+            
+            # 数据去重
+            try:
+                df_factor = df_factor[~df_factor[date].duplicated()]
+            except Exception as e:
+                print(f"处理去重时出错: {str(e)}")
+                print(df_factor)
+            
+            # 确保 df_factor 中的 trade_date 列为字符串类型
+            # 财务报表时间处理 (conv=3)
+            if conv == 3:
+                df_factor[date] = df_factor[date].astype(str)
+                df_factor[date] = pd.to_datetime(df_factor[date], format='%Y%m%d', errors='coerce')
+                df_factor[date] = df_factor[date] + timedelta(days=1)
+                df_factor[date] = df_factor[date].astype(str)
+                df_factor[date] = df_factor[date].map(lambda x: x.replace('-', ''))
+                df_factor['trade_date'] = df_factor[date].astype(str)
+            
+            # 时间格式转换 (conv=1)
+            elif conv == 1:
+                df_factor[date] = df_factor[date].astype(str)
+                df_factor['trade_date'] = df_factor[date].map(lambda x: x.replace('-', ''))
+            # 其他情况保持原样，但确保列名一致和类型一致
+            elif 'trade_date' not in df_factor.columns:
+                df_factor.rename(columns={date: 'trade_date'}, inplace=True)
+            
+            # 确保 trade_date 列为字符串类型
+            df_factor['trade_date'] = df_factor['trade_date'].astype(str)
+            
+            # 处理列名重复
+            overlap_cols = [col for col in df_single.columns if col in df_factor.columns 
+                          and col != 'trade_date' and col != 'code']
+            df_single = df_single.drop(columns=overlap_cols)
+            
+            # 打印数据类型信息以便调试
+            # print(f"df_single['trade_date'] dtype: {df_single['trade_date'].dtype}")
+            # print(f"df_factor['trade_date'] dtype: {df_factor['trade_date'].dtype}")
+            
+            # 合并数据
+            try:
+                df_merged = pd.merge(df_single, df_factor, how='left', on='trade_date', validate="one_to_one", copy=True)
+            except ValueError as e:
+                print(f"合并数据时出错: {str(e)}")
+                print(f"df_single['trade_date'] dtype: {df_single['trade_date'].dtype}")
+                print(f"df_factor['trade_date'] dtype: {df_factor['trade_date'].dtype}")
+                # 尝试使用 concat 方法
+                df_single.set_index('trade_date', inplace=True)
+                df_factor.set_index('trade_date', inplace=True)
+                df_merged = pd.concat([df_single, df_factor], axis=1)
+                df_merged.reset_index(inplace=True)
+            
+            df_merged.drop_duplicates('trade_date', inplace=True)
+            
+            # 根据 conv 参数确定是否向下填充
+            if conv != 2:  # conv!=2 表示需要填充
+                # 执行前向填充并明确处理数据类型
+                df_merged = df_merged.ffill()
+                # 使用infer_objects明确处理数据类型，避免隐式类型转换警告
+                df_merged = df_merged.infer_objects(copy=False)
+            
+            # 处理可能的列冲突 (code_x, code_y)
+            if 'code_x' in df_merged.columns and 'code_y' in df_merged.columns:
+                df_merged['code'] = df_merged['code_x'].combine_first(df_merged['code_y'])
+                df_merged.drop(['code_x', 'code_y'], axis=1, inplace=True)
+            
+            return df_merged
         except Exception as e:
-            print(df_factor)
+            print(f"处理股票 {code} 时出错: {str(e)}")
+            traceback.print_exc()
+            return pd.DataFrame()
+    
+    result_dfs = []
+    
+    # 使用线程池并行处理每个股票
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务并获取Future对象列表
+        future_to_ts_code = {executor.submit(process_single_stock, ts_code): ts_code for ts_code in ts_codes}
         
-        #财务报表中的时间，需要+1处理
-        if conv==3:
-            df_factor[date]=df_factor[date].astype(str)
-            df_factor[date]=pd.to_datetime(df_factor[date],format='%Y%m%d',errors='coerce')
-            df_factor[date]=df_factor[date]+timedelta(days=1)
-            df_factor[date]=df_factor[date].astype(str)
-            df_factor[date]=df_factor[date].map(lambda x: x.replace('-',''))  
-            df_factor['trade_date']=df_factor[date].map(lambda x: x.replace('-',''))
+        # 获取任务结果
+        for future in future_to_ts_code:
+            try:
+                df_result = future.result()
+                if not df_result.empty:
+                    result_dfs.append(df_result)
+            except Exception as e:
+                print(f"处理结果时出错: {str(e)}")
+                traceback.print_exc()
 
+    # 合并所有处理过的数据
+    if result_dfs:
+        final_df = pd.concat(result_dfs)
+        if 'code' in final_df.columns and 'ts_code' in final_df.columns:
+            final_df['code'] = final_df['ts_code']
+        # 恢复原始索引结构
+        if has_multi_index:
+            # 确保有必要的列用于重建索引
+            index_names = original_index.names
+            if 'time' in df.columns:
+                final_df = final_df.sort_values(['code', 'time'])
+                # 设置多级索引——层级顺序必须与 original_index.names 声明的一致。
+                # 原实现 set_index(['code','time']) 后仅改名 ['time','code']，
+                # 层级实际为 (code,time) 而名字声称 (time,code)：调用方按索引对齐
+                # 赋值（df[col]=out[col]）时全部落 NaN（2014-2015 估值因子全空根因）。
+                final_df = final_df.set_index(['time', 'code'])
+            else:
+                # 如果没有time列，尝试用trade_date代替
+                final_df = final_df.sort_values(['code', 'trade_date'])
+                # 将trade_date转回datetime格式
+                try:
+                    final_df['time'] = pd.to_datetime(final_df['trade_date'], format='%Y%m%d')
+                except Exception as e:
+                    print(f"将trade_date转换为时间失败: {str(e)}")
+                    # 创建一个临时time列
+                    final_df['time'] = pd.to_datetime('19700101')
+                final_df = final_df.set_index(['code', 'time'])
+            
+            # 重命名索引以匹配原始索引名称
+            final_df.index.names = index_names
         
-        if not 'pandas' in str(type(df_factor)) or df_factor.empty:
-            df_res=df
-            for f in filed.split(','):
-                df[f]=0
-            return df_res
+        return final_df
+    else:
+        # 如果没有数据，返回一个保持原始索引结构的空DataFrame
+        return pd.DataFrame(index=original_index)
 
-        #转换时间,将yyyy-mm-dd转为yyyymmdd
-        if conv==1:
-            df_factor[date]=df_factor[date].astype(str)
-            df_factor['trade_date']=df_factor[date].map(lambda x: x.replace('-',''))
-
-        # 找出两个 DataFrame 中重复的列名，除了用于合并的 'trade_date' 列
-        overlap_cols = [col for col in df.columns if col in df_factor.columns and col != 'trade_date']
-        # 从 df 中删除这些重复的列
-        df = df.drop(columns=overlap_cols)          
-
-        df_res=pd.merge(df, df_factor, how='left', on='trade_date',validate="one_to_many", copy=True, indicator=False)
-        df_res.drop_duplicates('trade_date',inplace = True)
-        
-        # print(df)
-        # print(df_res)
-
-        if conv==2: #不填充
-            pass
-        else:
-            df_res=df_res.fillna(method='ffill') # conv=0向下填充
-        
-        df_res=df_res.set_index('index')
-        
-        del df_factor
-        return df_res
-        
 
