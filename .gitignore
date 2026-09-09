@@ -1,4 +1,18 @@
 examples/demo-project/data/*
+/data/**
+# 只入库加密货币行情与参考数据, 其余(缓存/回测pkl/日志)留在本地
+!/data/market/
+/data/market/**
+!/data/market/kline/
+/data/market/kline/**
+!/data/market/kline/codebased/
+/data/market/kline/codebased/**
+!/data/market/kline/codebased/global_cryptospot/
+!/data/market/kline/codebased/global_cryptospot/**
+!/data/market/reference/
+/data/market/reference/**
+!/data/market/reference/global_cryptospot/
+!/data/market/reference/global_cryptospot/**
 *.log
 *.pyc
 __pycache__/
