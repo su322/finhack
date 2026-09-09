@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
-"""唐奇安通道突破(海龟, 单币种): 收盘价创 55 日新高全仓买入,
-跌破 20 日最低清仓. 经典趋势跟踪.
+"""唐奇安通道突破(海龟, 单币种): 收盘价创 entry_win 日新高全仓买入,
+跌破 exit_win 日最低清仓. 经典趋势跟踪.
 
 
-运行参数: params='{"symbol": "BTCUSDC"}', 默认 BTCUSDC.
+运行参数: params='{"symbol": "BTCUSDC", "entry_win": 55, "exit_win": 20}',
+默认 55/20.
 """
 
 
 def initialize(context):
     g.symbol = context.get('params', {}).get('symbol', 'BTCUSDC')
+    g.entry_win = int(context.get('params', {}).get('entry_win', 55))
+    g.exit_win = int(context.get('params', {}).get('exit_win', 20))
     set_benchmark(g.symbol)
     set_order_cost(OrderCost(open_tax=0, close_tax=0,
                              open_commission=0.001, close_commission=0.001,
                              min_commission=0), type='crypto')
     set_slippage(0.0005, type='crypto')
-    g.entry_win = 55
-    g.exit_win = 20
     g.closes = []
     run_daily(trade, time="23:55:00")
 

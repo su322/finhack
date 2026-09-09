@@ -21,18 +21,18 @@ START, END, CASH = '2018-12-15', '2026-09-08', 10000.0
 CURRENT_YEAR = 2026  # 未满一年, 表格中标注*
 
 
-def make_args(strategy, symbol):
+def make_args(strategy, symbol, extra=None):
     return SimpleNamespace(
         market='global_cryptospot', freq='1d',
         start_time=START, end_time=END,
         cash=CASH, benchmark=symbol, strategy=strategy,
-        universe=[symbol], params=json.dumps({'symbol': symbol}), model_id='',
-        vendor='backtest', _cmdline_args={},
+        universe=[symbol], params=json.dumps({'symbol': symbol, **(extra or {})}),
+        model_id='', vendor='backtest', _cmdline_args={},
     )
 
 
-def run_one(strategy, symbol):
-    trader = BacktestTrader(make_args(strategy, symbol))
+def run_one(strategy, symbol, extra=None, label=None):
+    trader = BacktestTrader(make_args(strategy, symbol, extra))
     trader.run()
     perf = trader.context.get('performance', {}) or {}
     ind = perf.get('indicators') or {}
@@ -44,7 +44,7 @@ def run_one(strategy, symbol):
         except (TypeError, ValueError):
             pass
     return {
-        'strategy': strategy, 'symbol': symbol, 'curve': curve,
+        'strategy': label or strategy, 'symbol': symbol, 'curve': curve,
         'total': ind.get('total_return'), 'annual': ind.get('annual_return'),
         'mdd': ind.get('max_drawdown'), 'sharpe': ind.get('sharpe_ratio'),
         'trades': perf.get('trade_num'),

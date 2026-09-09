@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
-"""时间序列动量 TSM(单币种): 30 日收益 > 0 全仓持有, 否则空仓.
+"""时间序列动量 TSM(单币种): lookback 日收益 > 0 全仓持有, 否则空仓.
 学术上被反复验证跨资产稳健的时间序列动量规则.
 
 
-运行参数: params='{"symbol": "BTCUSDC"}', 默认 BTCUSDC.
+运行参数: params='{"symbol": "BTCUSDC", "lookback": 30}', lookback 默认 30.
 """
 
 
 def initialize(context):
     g.symbol = context.get('params', {}).get('symbol', 'BTCUSDC')
+    g.lookback = int(context.get('params', {}).get('lookback', 30))
     set_benchmark(g.symbol)
     set_order_cost(OrderCost(open_tax=0, close_tax=0,
                              open_commission=0.001, close_commission=0.001,
                              min_commission=0), type='crypto')
     set_slippage(0.0005, type='crypto')
-    g.lookback = 30
     g.closes = []
     run_daily(trade, time="23:55:00")
 
